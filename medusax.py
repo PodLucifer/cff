@@ -19,21 +19,17 @@ def dump_contacts():
     contacts = output.splitlines()
     print(Fore.GREEN + f"Fetched {len(contacts)} contacts...")
     
-    # Předpokládejme, že první kontakt obsahuje telefonní číslo
-    # Extrahujeme telefonní číslo z textu kontaktu
-    contact_details = contacts[0]
-    phone_number_match = re.search(r'number=(\+?\d+)', contact_details)
-    
+    # Regular expression to extract phone number from the contact string
+    phone_number_match = re.search(r'number=(\+?\d+)', contacts[0])
     if phone_number_match:
-        phone_number = phone_number_match.group(1)  # Získání telefonního čísla
+        phone_number = phone_number_match.group(1)  # Extracts the phone number
     else:
-        print(Fore.RED + "No valid phone number found in contact!")
+        print(Fore.RED + "No phone number found in the first contact.")
         return
-
-    # Ujistíme se, že telefonní číslo je použitelné jako název souboru
-    phone_number = phone_number.replace("+", "")  # Odstranit "+" z telefonního čísla
-
-    # Uložit do souboru
+    
+    # Ensure the phone number is valid for use in filenames (remove any special characters)
+    phone_number = re.sub(r'[^0-9+]', '', phone_number)  # Keep only digits and '+' symbol
+    
     with open(f"contacts_dump_{phone_number}.txt", 'w') as f:
         for contact in contacts:
             f.write(contact + "\n")
@@ -56,20 +52,17 @@ def dump_sms():
     sms = output.splitlines()
     print(Fore.GREEN + f"Fetched {len(sms)} SMS messages...")
     
-    # Předpokládejme, že první SMS obsahuje telefonní číslo
-    sms_details = sms[0]
-    phone_number_match = re.search(r'address=\'(\+?\d+)', sms_details)
-    
+    # Regular expression to extract phone number from the first SMS message
+    phone_number_match = re.search(r'address=(\+?\d+)', sms[0])
     if phone_number_match:
-        phone_number = phone_number_match.group(1)  # Získání telefonního čísla
+        phone_number = phone_number_match.group(1)  # Extracts the phone number
     else:
-        print(Fore.RED + "No valid phone number found in SMS!")
+        print(Fore.RED + "No phone number found in the first SMS.")
         return
-
-    # Ujistíme se, že telefonní číslo je použitelné jako název souboru
-    phone_number = phone_number.replace("+", "")  # Odstranit "+" z telefonního čísla
-
-    # Uložit do souboru
+    
+    # Ensure the phone number is valid for use in filenames (remove any special characters)
+    phone_number = re.sub(r'[^0-9+]', '', phone_number)  # Keep only digits and '+' symbol
+    
     with open(f"sms_dump_{phone_number}.txt", 'w') as f:
         for message in sms:
             f.write(message + "\n")
