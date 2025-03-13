@@ -83,7 +83,7 @@ void handle_client() {
 }
 
 int main() {
-    printf("Starting HANDLER in Android mode...\n");
+    printf("Starting TCP HANDLER in Android mode...\n");
 
     // Checking if devices are connected
     int connected_devices = system("adb devices | grep -w 'device' | wc -l");
