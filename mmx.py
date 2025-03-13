@@ -1,7 +1,8 @@
 import subprocess
 import os
-import time
 from colorama import Fore, init
+import shutil
+import time
 
 init(autoreset=True)
 
@@ -68,6 +69,39 @@ def make_call(destination):
     else:
         print(Fore.GREEN + f"Calling {destination}...")
 
+def execute_shell_command(command):
+    """Execute a shell command on the Android device"""
+    print(Fore.YELLOW + f"Executing shell command: {command}")
+    stdout, stderr = run_adb_command(['adb', 'shell', command])
+    if stderr:
+        print(Fore.RED + f"Error executing shell command: {stderr}")
+    else:
+        print(Fore.GREEN + f"Command executed successfully:\n{stdout}")
+
+def upload_file(local_file_path, remote_path):
+    """Upload a file from local system to Android device"""
+    if not os.path.exists(local_file_path):
+        print(Fore.RED + f"Error: File {local_file_path} does not exist!")
+        return
+
+    print(Fore.YELLOW + f"Uploading file {local_file_path} to {remote_path} on Android device...")
+    try:
+        # Use adb push to upload the file
+        subprocess.run(['adb', 'push', local_file_path, remote_path], check=True)
+        print(Fore.GREEN + f"File uploaded successfully to {remote_path}")
+    except subprocess.CalledProcessError as e:
+        print(Fore.RED + f"Error uploading file: {e}")
+
+def take_webcam_snap():
+    """Take a snapshot from the webcam"""
+    print(Fore.YELLOW + "Taking a snapshot with the webcam...")
+    stdout, stderr = run_adb_command(['adb', 'shell', 'am', 'start', '-a', 'android.media.action.IMAGE_CAPTURE'])
+    
+    if stderr:
+        print(Fore.RED + f"Error taking snapshot: {stderr}")
+    else:
+        print(Fore.GREEN + "Snapshot taken successfully!")
+
 def start_handler():
     """Start handler and execute commands based on inputs"""
     print(Fore.GREEN + "Starting HANDLER in Android mode...")
@@ -106,6 +140,14 @@ def start_handler():
                 make_call(destination)
             except ValueError:
                 print(Fore.RED + "Error: Invalid command. Format: call <destination>")
+        elif command.startswith("shell"):
+            _, shell_command = command.split(' ', 1)
+            execute_shell_command(shell_command)
+        elif command.startswith("upload_file"):
+            _, local_file, remote_path = command.split(' ', 2)
+            upload_file(local_file, remote_path)
+        elif command == "take_snapshot":
+            take_webcam_snap()
         elif command == "exit":
             print(Fore.GREEN + "Exiting...")
             break
