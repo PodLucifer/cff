@@ -290,6 +290,7 @@ def list_webcams():
         return "No webcams found."
     return '\n'.join(webcams)
 
+
 def main():
     try:
         context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
