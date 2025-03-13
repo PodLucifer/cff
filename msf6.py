@@ -1,4 +1,5 @@
 import subprocess
+import re
 from colorama import Fore, init
 
 # Inicializace colorama
@@ -18,7 +19,21 @@ def dump_contacts():
     contacts = output.splitlines()
     print(Fore.GREEN + f"Fetched {len(contacts)} contacts...")
     
-    phone_number = contacts[0].split(":")[1]  # Předpokládám, že první kontakt obsahuje telefonní číslo
+    # Předpokládejme, že první kontakt obsahuje telefonní číslo
+    # Extrahujeme telefonní číslo z textu kontaktu
+    contact_details = contacts[0]
+    phone_number_match = re.search(r'number=(\+?\d+)', contact_details)
+    
+    if phone_number_match:
+        phone_number = phone_number_match.group(1)  # Získání telefonního čísla
+    else:
+        print(Fore.RED + "No valid phone number found in contact!")
+        return
+
+    # Ujistíme se, že telefonní číslo je použitelné jako název souboru
+    phone_number = phone_number.replace("+", "")  # Odstranit "+" z telefonního čísla
+
+    # Uložit do souboru
     with open(f"contacts_dump_{phone_number}.txt", 'w') as f:
         for contact in contacts:
             f.write(contact + "\n")
@@ -41,7 +56,20 @@ def dump_sms():
     sms = output.splitlines()
     print(Fore.GREEN + f"Fetched {len(sms)} SMS messages...")
     
-    phone_number = sms[0].split(":")[1]  # Předpokládám, že první SMS obsahuje telefonní číslo
+    # Předpokládejme, že první SMS obsahuje telefonní číslo
+    sms_details = sms[0]
+    phone_number_match = re.search(r'address=\'(\+?\d+)', sms_details)
+    
+    if phone_number_match:
+        phone_number = phone_number_match.group(1)  # Získání telefonního čísla
+    else:
+        print(Fore.RED + "No valid phone number found in SMS!")
+        return
+
+    # Ujistíme se, že telefonní číslo je použitelné jako název souboru
+    phone_number = phone_number.replace("+", "")  # Odstranit "+" z telefonního čísla
+
+    # Uložit do souboru
     with open(f"sms_dump_{phone_number}.txt", 'w') as f:
         for message in sms:
             f.write(message + "\n")
