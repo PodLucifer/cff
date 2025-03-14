@@ -49,7 +49,7 @@ def webcam_list():
     print(Fore.GREEN + f"Found {len(webcams)} webcams: {', '.join(webcams)}")
 
 def start_handler():
-    print(Fore.YELLOW + "Starting HANDLER in Android mode...")
+    print(Fore.YELLOW + "Starting TCP HANDLER in Android mode...")
     while True:
         input_command = input(Fore.CYAN + "metercrack > ").strip()
         if input_command.startswith("dump_contacts"):
