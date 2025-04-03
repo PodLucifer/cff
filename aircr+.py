@@ -67,13 +67,13 @@ def extract_mic_and_nonce_and_ssid(input_file):
 
 # PBKDF2 to derive PMK using passlib
 def derive_pmk(password, ssid):
-    # Use passlib's pbkdf2_sha1 to derive the key
-    # The PBKDF2 from passlib returns a string formatted as "pbkdf2_sha1$rounds=4096$..."
-    # We need to extract the raw key from the generated hash.
-    raw_pmk = pbkdf2_sha1.using(rounds=4096).hash(password + ssid)
-    # Extract the raw key from the passlib result (after the `$` symbol)
-    raw_pmk_bytes = raw_pmk.split('$')[-1]
-    return binascii.unhexlify(raw_pmk_bytes)
+    # Use passlib's pbkdf2_sha1 to derive the key directly without formatting issues
+    pmk = pbkdf2_sha1.using(rounds=4096).hash(password + ssid)
+    
+    # Extract the raw key from the passlib hash (the part after the first "$" symbol)
+    raw_pmk = pmk.split('$')[-1]  # The actual raw key part
+    # Convert the raw PMK to bytes (by decoding from the base64 representation)
+    return binascii.a2b_base64(raw_pmk)
 
 # Generate PTK from PMK
 def derive_ptk(pmk, sta_mac, bssid, snonce, anonce):
