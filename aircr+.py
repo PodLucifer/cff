@@ -72,6 +72,12 @@ def derive_pmk(password, ssid):
     
     # Extract the raw key from the passlib hash (the part after the first "$" symbol)
     raw_pmk = pmk.split('$')[-1]  # The actual raw key part
+
+    # Ensure correct padding for base64
+    missing_padding = len(raw_pmk) % 4
+    if missing_padding != 0:
+        raw_pmk += '=' * (4 - missing_padding)
+
     # Convert the raw PMK to bytes (by decoding from the base64 representation)
     return binascii.a2b_base64(raw_pmk)
 
