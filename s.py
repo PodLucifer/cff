@@ -44,6 +44,9 @@ def extract_mic_and_nonce_and_ssid(input_file):
 
     return mic, snonce, sta_mac, bssid, anonce, ssid
 
+def prf512(key, a, b):
+    return hmac.new(key, a + b, hashlib.sha1).digest()[:32]
+
 def crack_psk(mic, snonce, sta_mac, bssid, anonce, ssid, wordlist):
     ssid = ssid.encode()
     sta_mac = binascii.unhexlify(sta_mac.replace(':', ''))
@@ -57,7 +60,7 @@ def crack_psk(mic, snonce, sta_mac, bssid, anonce, ssid, wordlist):
         pmk = hashlib.pbkdf2_hmac('sha1', psk, ssid, 4096, 32)
         print(f"PMK: {pmk.hex()}")
 
-        ptk = hmac.new(pmk, b"Pairwise key expansion" + min(sta_mac, bssid) + max(sta_mac, bssid) + anonce + snonce, hashlib.sha1).digest()[:32]
+        ptk = prf512(pmk, b"Pairwise key expansion", min(sta_mac, bssid) + max(sta_mac, bssid) + anonce + snonce)
         print(f"PTK: {ptk.hex()}")
 
         mic_calc = hmac.new(ptk[:16], b"EAPOL Message" + mic[18:], hashlib.sha1).digest()[:16]
