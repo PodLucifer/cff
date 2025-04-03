@@ -48,10 +48,11 @@ def derive_ptk(pmk, anonce, snonce, ap_mac, client_mac):
 
 def verify_mic(ptk, mic, eapol_frame):
     mic_key = ptk[:16]
-    eapol_data = eapol_frame.copy()
-    eapol_data[-18:-2] = b'\x00' * 16  # Zero out MIC field
+    # Create a copy of the eapol_frame with the MIC part zeroed out
+    eapol_data = eapol_frame[:-18] + b'\x00' * 16 + eapol_frame[-2:]
     computed_mic = hmac.new(mic_key, eapol_data, hashlib.sha1).digest()[:16]
     return computed_mic == mic
+
 
 def crack_psk(wordlist, snonce, anonce, mic, sta_mac, bssid, ssid, eapol_frame):
     with open(wordlist, 'r', encoding='utf-8') as f:
