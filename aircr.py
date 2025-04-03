@@ -5,7 +5,7 @@ import struct
 from scapy.all import *
 import argparse
 import binascii
-from pbkdf2 import pbkdf2_hmac
+from passlib.hash import pbkdf2_sha1
 
 # Extract the MIC, nonces, and SSID from the capture file
 def extract_mic_and_nonce_and_ssid(input_file):
@@ -65,9 +65,15 @@ def extract_mic_and_nonce_and_ssid(input_file):
     
     return mic, snonce, anonce, sta_mac, bssid, ssid
 
-# PBKDF2 to derive PMK
+# PBKDF2 to derive PMK using passlib
 def derive_pmk(password, ssid):
-    return pbkdf2_hmac('sha1', password.encode(), ssid.encode(), 4096, 32)
+    # Use passlib's pbkdf2_sha1 to derive the key
+    # The PBKDF2 from passlib returns a string formatted as "pbkdf2_sha1$rounds=4096$..."
+    # We need to extract the raw key from the generated hash.
+    raw_pmk = pbkdf2_sha1.using(rounds=4096).hash(password + ssid)
+    # Extract the raw key from the passlib result (after the `$` symbol)
+    raw_pmk_bytes = raw_pmk.split('$')[-1]
+    return binascii.unhexlify(raw_pmk_bytes)
 
 # Generate PTK from PMK
 def derive_ptk(pmk, sta_mac, bssid, snonce, anonce):
