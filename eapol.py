@@ -1,7 +1,7 @@
 import sys
 from scapy.all import *
 from hashlib import pbkdf2_hmac
-from binascii import a2b_hex, b2a_hex
+from binascii import a2b_hex, b2a_hex, Error as BinasciiError
 from struct import pack
 import hmac
 
@@ -69,10 +69,14 @@ def derive_psk(passphrase, ssid):
     return pmk
 
 def derive_ptk(pmk, snonce, anonce, sta_mac, bssid):
-    bssid_bytes = a2b_hex(bssid.replace(':', ''))
-    sta_mac_bytes = a2b_hex(sta_mac.replace(':', ''))
-    snonce_bytes = a2b_hex(snonce)
-    anonce_bytes = a2b_hex(anonce)
+    try:
+        bssid_bytes = a2b_hex(bssid.replace(':', ''))
+        sta_mac_bytes = a2b_hex(sta_mac.replace(':', ''))
+        snonce_bytes = a2b_hex(snonce)
+        anonce_bytes = a2b_hex(anonce)
+    except BinasciiError as e:
+        print(f"Error converting to bytes: {e}")
+        return None
     
     a = "Pairwise key expansion"
     b = min(bssid_bytes, sta_mac_bytes) + max(bssid_bytes, sta_mac_bytes) + min(anonce_bytes, snonce_bytes) + max(anonce_bytes, snonce_bytes)
