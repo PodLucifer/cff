@@ -29,7 +29,7 @@ def get_msg(pcap_file):
         print("Unable to extract complete handshake data.")
         return False
     return anonce, snonce, ap_mac, client_mac, eapol_payload, mic
-    # print(anonce, snonce, ap_mac, client_mac, eapol_payload, mic)
+    #print(anonce, snonce, ap_mac, client_mac, eapol_payload, mic)
 
 
 def calc_pmk(passphrase, ssid):
