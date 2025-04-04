@@ -106,8 +106,12 @@ class Wpa2PskAttack:
                 
                 # Récupération du EAPOL frame dans le troisième paquet et suppression de la valeur de MIC
                 eapol_frame = bytes(eapol_packet[EAPOL]).hex()
+                
+                # Dynamically find and zero out the MIC field
+                mic_offset_start = 162  # Adjust if necessary, based on your frame format
+                mic_offset_end = 194  # Adjust if necessary, based on your frame format
                 print(f"Original EAPOL Frame: {eapol_frame}")  # Debug: Check original EAPOL frame
-                eapol_frame = eapol_frame[:162] + (32 * "0") + eapol_frame[194:]
+                eapol_frame = eapol_frame[:mic_offset_start] + (32 * "0") + eapol_frame[mic_offset_end:]
                 print(f"Modified EAPOL Frame (MIC Zeroed): {eapol_frame}")  # Debug: Check modified EAPOL frame
                 print("=========================")
                 
