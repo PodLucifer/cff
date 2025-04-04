@@ -1,18 +1,30 @@
 import marshal
 import sys
-import types
 
-def decrypt_file(file_path):
-    with open(file_path, "rb") as f:
-        compiled_code = marshal.load(f)  # Load the marshaled code
+def decrypt_file(input_filename):
+    try:
+        # Read the encrypted content from the file
+        with open(input_filename, 'rb') as f:
+            encrypted_data = f.read()
+
+        # Decrypt using marshal.loads (unmarshal the data)
+        decrypted_data = marshal.loads(encrypted_data)
+
+        # Generate the output filename
+        output_filename = f"{input_filename.split('.')[0]}-dec.txt"
+
+        # Save the decrypted content to the new file
+        with open(output_filename, 'w') as f:
+            f.write(decrypted_data)
+
+        print(f"Decrypted content has been saved to {output_filename}")
     
-    if isinstance(compiled_code, types.CodeType):
-        exec(compiled_code)  # Execute the decrypted Python code
-    else:
-        print("Invalid marshaled code file.")
+    except Exception as e:
+        print(f"Error: {e}")
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        print("Usage: python decrypt.py <file.py>")
+        print("Usage: python decrypt.py <filename>")
     else:
-        decrypt_file(sys.argv[1])
+        input_filename = sys.argv[1]
+        decrypt_file(input_filename)
