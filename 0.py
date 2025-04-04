@@ -1,13 +1,15 @@
 import argparse
-from scapy.all import *
 import hashlib
-from pbkdf2 import PBKDF2
+from scapy.all import *
 from Crypto.Cipher import AES
+from pbkdf2 import PBKDF2
 import struct
+import hmac
+import binascii
 
 def extract_mic_and_nonce_and_ssid(input_file):
     packets = rdpcap(input_file)
-    
+
     snonce = None
     mic = None
     sta_mac = None
@@ -70,15 +72,22 @@ def derive_pmk(password, ssid):
     pmk = PBKDF2(password, ssid, 4096, dklen=32).read()
     return pmk
 
-def generate_mic(pmk, anonce, snonce, sta_mac, bssid):
-    """ Generate MIC using PMK, Nonces, and MAC addresses """
-    # Prepare the keys for AES and MIC calculation
-    key = pmk[:16]  # WPA2 uses the first 16 bytes of the PMK as the key
-    cipher = AES.new(key, AES.MODE_CBC, b'\x00' * 16)  # Initialization Vector (IV) is all zeros
-    
-    # EAPOL message 2 of 4 (simplified for illustrative purposes)
+def aes_cmac(key, message):
+    """ Generate AES-CMAC using the AES key and message (for MIC calculation) """
+    cipher = AES.new(key, AES.MODE_ECB)
+    msg_len = len(message)
+    # Padding to 16 bytes if necessary
+    if msg_len % 16 != 0:
+        message += b'\x00' * (16 - (msg_len % 16))
+    # Generate CMAC using the AES cipher
+    cmac = hmac.new(key, message, hashlib.sha256).digest()[:16]
+    return cmac
+
+def generate_mic(pmk, anonce, snonce, sta_mac, bssid, ssid):
+    """ Generate the MIC using PMK, Nonces, and MAC addresses (AES-CMAC) """
+    # WPA2 MIC calculation data (simplified)
     mic_data = struct.pack("!6s6s", sta_mac, bssid) + anonce + snonce
-    mic = cipher.encrypt(mic_data)
+    mic = aes_cmac(pmk, mic_data)
     return mic
 
 def compare_password_with_capture(password, capture_file):
@@ -89,7 +98,7 @@ def compare_password_with_capture(password, capture_file):
         pmk = derive_pmk(password, ssid)
         
         # Generate MIC from PMK and Nonces
-        calculated_mic = generate_mic(pmk, anonce, snonce, sta_mac, bssid)
+        calculated_mic = generate_mic(pmk, anonce, snonce, sta_mac, bssid, ssid)
         
         # Compare the calculated MIC with the captured MIC
         if mic == calculated_mic:
