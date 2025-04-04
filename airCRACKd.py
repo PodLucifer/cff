@@ -17,7 +17,7 @@ def load_handshake(pcap_file):
     packets = rdpcap(pcap_file)
     handshake = [pkt for pkt in packets if pkt.haslayer("EAPOL")]
 
-    if len(handshake) >= 4:
+    if len(handshake) >= 3:
         print("[+] Handshake successfully captured!")
         return handshake
     else:
