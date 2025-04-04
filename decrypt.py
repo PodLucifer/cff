@@ -5,10 +5,8 @@ def decrypt_file(input_filename):
     try:
         # Read the encrypted content from the file
         with open(input_filename, 'rb') as f:
-            encrypted_data = f.read()
-
-        # Decrypt using marshal.loads (unmarshal the data)
-        decrypted_data = marshal.loads(encrypted_data)
+            # Use marshal.load to load the data from the file
+            decrypted_data = marshal.load(f)
 
         # Generate the output filename
         output_filename = f"{input_filename.split('.')[0]}-dec.txt"
