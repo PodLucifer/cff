@@ -69,8 +69,9 @@ def derive_pmk(password, ssid):
     ssid = ssid.encode('utf-8')
     password = password.encode('utf-8')
     # PBKDF2 key derivation function
-    pmk = PBKDF2(password, ssid, 4096, dklen=32).read()
+    pmk = PBKDF2(password, ssid, 4096, keylen=32).read()  # Use keylen instead of dklen
     return pmk
+
 
 def aes_cmac(key, message):
     """ Generate AES-CMAC using the AES key and message (for MIC calculation) """
