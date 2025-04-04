@@ -26,7 +26,7 @@ def get_msg(pcap_file):
                 break
         flags.append(bytes(packet[EAPOL]))
     if not all([anonce, snonce, ap_mac, client_mac, eapol_payload, mic]):
-        print("无法提取完整握手数据。")
+        print("Unable to extract complete handshake data.")
         return False
     return anonce, snonce, ap_mac, client_mac, eapol_payload, mic
     # print(anonce, snonce, ap_mac, client_mac, eapol_payload, mic)
