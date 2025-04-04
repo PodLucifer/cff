@@ -3,7 +3,7 @@ from dnslib import DNSRecord, QTYPE
 
 def start_dns_server():
     # Nastavení DNS serveru (používáme localhost a port 53 pro testování)
-    server_ip = '10.0.1.33'
+    server_ip = '10.0.1.12'
     server_port = 53
 
     # Vytvoření socketu pro příjem DNS požadavků
