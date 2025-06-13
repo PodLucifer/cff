@@ -31,8 +31,15 @@ KDF_RK_INFO = b"DR:root"
 KDF_RK_HE_INFO = b"DR:root:he"
 KDF_AEAD_INFO = b"DR:aead"
 
+# X3DH constants
+X3DH_IDENTITY_KEY_INFO = b"X3DH:id"
+X3DH_EPH_INFO = b"X3DH:eph"
+X3DH_SHARED_SECRET_INFO = b"X3DH:ssk"
+X3DH_DH_OUTPUT_SIZE = 32
+
 # -- Errors --
 class DoubleRatchetError(Exception): pass
+class X3DHError(Exception): pass
 
 # -- Utility functions --
 def hkdf_sha256(salt: bytes, ikm: bytes, info: bytes, outlen: int) -> bytes:
@@ -435,4 +442,101 @@ class DoubleRatchet(metaclass=abc.ABCMeta):
             "NHKr": self.state.NHKr.hex() if self.state.NHKr else None,
         }
 
-# End of dr.py
+# -- X3DH KEY AGREEMENT PROTOCOL --
+class X3DH:
+    """
+    Implements the X3DH key agreement protocol for establishing a shared secret
+    suitable as root key for Double Ratchet.
+    No I/O, networking, or serialization included. All keys are X25519.
+    Public keys are bytes (32), private keys are nacl.public.PrivateKey.
+    """
+
+    @staticmethod
+    def generate_identity_keypair() -> Tuple[PrivateKey, PublicKey]:
+        """Generate a long-term identity key pair."""
+        priv = PrivateKey.generate()
+        return priv, priv.public_key
+
+    @staticmethod
+    def generate_signed_prekey() -> Tuple[PrivateKey, PublicKey]:
+        """Generate a signed prekey (SPK). (Signature not handled here)"""
+        priv = PrivateKey.generate()
+        return priv, priv.public_key
+
+    @staticmethod
+    def generate_onetime_prekey() -> Tuple[PrivateKey, PublicKey]:
+        """Generate a one-time prekey (OPK)."""
+        priv = PrivateKey.generate()
+        return priv, priv.public_key
+
+    @staticmethod
+    def dh(priv: PrivateKey, pub: bytes) -> bytes:
+        """Perform DH with a nacl PrivateKey and a raw public key (bytes)."""
+        return crypto_scalarmult(priv.encode(RawEncoder), pub)
+
+    @staticmethod
+    def sender_calculate_shared_secret(
+        ik_sender_priv: PrivateKey,
+        ek_sender_priv: PrivateKey,
+        ik_recipient_pub: bytes,
+        spk_recipient_pub: bytes,
+        opk_recipient_pub: Optional[bytes] = None,
+        info: bytes = X3DH_SHARED_SECRET_INFO
+    ) -> Tuple[bytes, bytes, bytes, Optional[bytes]]:
+        """
+        Sender combines four DHs (as in X3DH):
+          DH1 = DH(IK_sender, SPK_recipient)
+          DH2 = DH(EK_sender, IK_recipient)
+          DH3 = DH(EK_sender, SPK_recipient)
+          DH4 = DH(EK_sender, OPK_recipient)  (optional, if OPK is published)
+        Returns (shared_secret, ek_sender_pub, used_opk_pub, opk_pub)
+        """
+        DH1 = X3DH.dh(ik_sender_priv, spk_recipient_pub)
+        DH2 = X3DH.dh(ek_sender_priv, ik_recipient_pub)
+        DH3 = X3DH.dh(ek_sender_priv, spk_recipient_pub)
+        if opk_recipient_pub:
+            DH4 = X3DH.dh(ek_sender_priv, opk_recipient_pub)
+            dhs = DH1 + DH2 + DH3 + DH4
+        else:
+            dhs = DH1 + DH2 + DH3
+        shared_secret = hkdf_sha256(
+            salt=b'\x00' * 32,
+            ikm=dhs,
+            info=info,
+            outlen=ROOT_KEY_SIZE
+        )
+        return shared_secret, ek_sender_priv.public_key.encode(RawEncoder), opk_recipient_pub, opk_recipient_pub
+
+    @staticmethod
+    def recipient_calculate_shared_secret(
+        ik_recipient_priv: PrivateKey,
+        spk_recipient_priv: PrivateKey,
+        ek_sender_pub: bytes,
+        ik_sender_pub: bytes,
+        opk_recipient_priv: Optional[PrivateKey] = None,
+        info: bytes = X3DH_SHARED_SECRET_INFO
+    ) -> bytes:
+        """
+        Recipient computes the same shared secret as sender.
+        """
+        DH1 = X3DH.dh(ik_recipient_priv, spk_recipient_priv.public_key.encode(RawEncoder))  # Not needed, see X3DH spec.
+        DH1 = X3DH.dh(ik_recipient_priv, spk_recipient_priv.public_key.encode(RawEncoder))  # Not used
+        DH1 = X3DH.dh(ik_recipient_priv, spk_recipient_priv.public_key.encode(RawEncoder))  # Not used
+        DH1 = X3DH.dh(ik_recipient_priv, spk_recipient_priv.public_key.encode(RawEncoder))  # Not used
+
+        # Compute from sender's keys
+        DH1 = X3DH.dh(ik_recipient_priv, ek_sender_pub)  # IK_r, EK_s
+        DH2 = X3DH.dh(spk_recipient_priv, ik_sender_pub)  # SPK_r, IK_s
+        DH3 = X3DH.dh(spk_recipient_priv, ek_sender_pub)  # SPK_r, EK_s
+        if opk_recipient_priv:
+            DH4 = X3DH.dh(opk_recipient_priv, ek_sender_pub)  # OPK_r, EK_s
+            dhs = DH1 + DH2 + DH3 + DH4
+        else:
+            dhs = DH1 + DH2 + DH3
+        shared_secret = hkdf_sha256(
+            salt=b'\x00' * 32,
+            ikm=dhs,
+            info=info,
+            outlen=ROOT_KEY_SIZE
+        )
+        return shared_secret
