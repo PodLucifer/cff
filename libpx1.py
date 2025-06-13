@@ -419,6 +419,8 @@ class DoubleRatchet(metaclass=abc.ABCMeta):
         # Initial setup: if header_encryption is used, require header_keys
         if self.header_encryption:
             # Header encryption variant
+            if not header_keys or not all(k in header_keys for k in ('HKs', 'NHKs', 'HKr', 'NHKr')):
+                raise ValueError("Header keys required for header encryption variant")
             self._init_header_encryption(root_key, dh_pair, dh_remote_pub, header_keys)
         else:
             self._init_plain(root_key, dh_pair, dh_remote_pub)
