@@ -17,6 +17,70 @@ from nacl.encoding import RawEncoder
 from nacl.signing import SigningKey, VerifyKey
 from nacl.exceptions import BadSignatureError
 
+import hashlib
+
+# --- PXAddress: Unique Address Abstraction for Multi-Device ---
+class PXAddress:
+    """
+    PXAddress uniquely identifies a remote party (user/device) in Signal-style E2E communication.
+    - name: user ID (phone number, username, etc.)
+    - device_id: integer (to support multiple devices per user)
+    """
+
+    def __init__(self, name: str, device_id: int):
+        self._name = name
+        self._device_id = device_id
+
+    def getName(self) -> str:
+        """Returns the user name/identifier."""
+        return self._name
+
+    def getDeviceId(self) -> int:
+        """Returns the device ID."""
+        return self._device_id
+
+    def toString(self) -> str:
+        """Returns a string like 'alice.1'."""
+        return f"{self._name}.{self._device_id}"
+
+    def __eq__(self, other):
+        return isinstance(other, PXAddress) and \
+               self._name == other._name and \
+               self._device_id == other._device_id
+
+    def __hash__(self):
+        return hash((self._name, self._device_id))
+
+    def __repr__(self):
+        return f"<PXAddress {self.toString()}>"
+
+# --- NumericFingerprint: Calculation of Fingerprints for Identity Verification ---
+class NumericFingerprint:
+    """
+    Implements Signal-style numeric fingerprint for identity key verification.
+    Produces a numeric code (decimals) for two public keys and extra info.
+    """
+
+    @staticmethod
+    def calculate(local_identity: bytes, remote_identity: bytes, info: bytes = b"PXFingerprint", digits: int = 60) -> str:
+        """
+        Returns a human-verifiable fingerprint string for two public keys.
+        - local_identity: bytes (32)
+        - remote_identity: bytes (32)
+        - info: context string (default "PXFingerprint")
+        """
+        # Standard: SHA256 over sorted keys + info
+        keys = sorted([local_identity, remote_identity])
+        h = hashlib.sha256()
+        h.update(keys[0])
+        h.update(keys[1])
+        h.update(info)
+        digest = h.digest()
+        # Convert to a decimal fingerprint (like Signal's 60-digit code)
+        num = int.from_bytes(digest, "big")
+        fingerprint = str(num).zfill(digits)[-digits:]  # pad/truncate to fixed size
+        return fingerprint
+
 # -- Constants --
 MAX_SKIP = 1000
 AES_KEY_SIZE = 32
@@ -279,6 +343,57 @@ class DoubleRatchetState:
     def deserialize(data: bytes) -> "DoubleRatchetState":
         return pickle.loads(data)
 
+    def get_skipped_keys(self):
+        """Returns the skipped message keys for storage (for missed messages)."""
+        return self.MKSKIPPED.copy()
+
+# --- SessionStore (SignalProtocolStore): Persistent Session Storage API ---
+class SessionStore(abc.ABC):
+    """
+    Abstract session store for missed message keys and session state.
+    Implementations should store SessionRecord (and skipped keys) persistently.
+    """
+
+    @abc.abstractmethod
+    def putSession(self, address: PXAddress, sessionRecord: "SessionRecord"):
+        """Store the session record (including skipped message keys) for PXAddress."""
+        pass
+
+    @abc.abstractmethod
+    def getSession(self, address: PXAddress) -> Optional["SessionRecord"]:
+        """Retrieve the session record for PXAddress."""
+        pass
+
+# --- SessionRecord: Holds all session state including skipped message keys ---
+class SessionRecord:
+    """
+    Container for all session state, including skipped message keys.
+    Used for serialization and persistent storage.
+    """
+    def __init__(self, state: DoubleRatchetState):
+        self.state_bytes = state.serialize()
+        self.skipped_keys = state.get_skipped_keys()  # Dict[(bytes, int), bytes]
+
+    def get_state(self) -> DoubleRatchetState:
+        return DoubleRatchetState.deserialize(self.state_bytes)
+
+    def get_skipped_keys(self) -> Dict[Tuple[bytes, int], bytes]:
+        return self.skipped_keys
+
+# --- Message Whispering: Metadata for sending private messages to specific PXAddress(es) ---
+class WhisperMessage:
+    """
+    Represents a 'whispered' message to a specific PXAddress.
+    """
+    def __init__(self, to: PXAddress, ciphertext: bytes, header: bytes, ad: bytes = b""):
+        self.to = to
+        self.ciphertext = ciphertext
+        self.header = header
+        self.ad = ad
+
+    def __repr__(self):
+        return f"<WhisperMessage to={self.to.toString()} len={len(self.ciphertext)}>"
+
 # -- Double Ratchet (main API) --
 class DoubleRatchet(metaclass=abc.ABCMeta):
     """
@@ -378,6 +493,14 @@ class DoubleRatchet(metaclass=abc.ABCMeta):
         self.state.Ns += 1
         ct = encrypt(mk, plaintext, concat_ad(ad, enc_header))
         return enc_header, ct
+
+    def whisper(self, to: PXAddress, plaintext: bytes, ad: bytes = b'') -> WhisperMessage:
+        """
+        Encrypts a message as a 'whisper' to a specific PXAddress (device).
+        Returns a WhisperMessage which bundles ciphertext, header, and address.
+        """
+        header, ciphertext = self.encrypt(plaintext, ad)
+        return WhisperMessage(to, ciphertext, header, ad)
 
     def decrypt(self, header: bytes, ciphertext: bytes, ad: bytes = b'') -> bytes:
         """
