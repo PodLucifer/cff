@@ -899,11 +899,15 @@ def main():
     elif proto == "oracle":
         target_func = lambda u, p, child_id, attempt_num, total: oracle_bruteforce(u, p, child_id, attempt_num, total, target_ip=target_ip, port=target_port or 1521, debug=False)
     elif proto == "imap":
-        target_func = lambda u, p, child_id, attempt_num, total: imap_bruteforce(u, p, child_id, attempt_num, total, target_ip=target_ip, port=target_port or (993 if args.ssl else 143), use_ssl=args.s[...]
+        target_func = lambda u, p, child_id, attempt_num, total: imap_bruteforce(
+            u, p, child_id, attempt_num, total,
+            target_ip=target_ip,
+            port=target_port or (993 if args.ssl else 143),
+            use_ssl=args.ssl
+        )
     else:
         error_message(f"Protocol {proto} not implemented.")
         sys.exit(1)
-
     # ------- Multiprocessing for speed -------
     num_procs = max(1, args.threads // 4)
     manager = multiprocessing.Manager()
