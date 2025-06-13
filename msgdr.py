@@ -222,12 +222,11 @@ class AES256GCM(AEADIFace):
             raise AuthenticationFailed("Invalid ciphertext")
         return pt
 
-# --- crypto/x3dh.py (PyNaCl, like Signal) ---
+# --- crypto/x3dh.py (PyNaCl) ---
 
 import nacl.public
 import nacl.utils
 from nacl.bindings import crypto_scalarmult
-from nacl.signing import SigningKey, VerifyKey
 
 class X3DHError(Exception):
     pass
@@ -238,34 +237,24 @@ class X3DHKeyBundle(SerializableIface):
       - identity_key: long-term X25519 keypair
       - signed_prekey: medium-term X25519 keypair
       - one_time_prekey: short-term X25519 keypair (optional)
-      - spk_signature: Ed25519 signature (bytes) of signed_prekey by identity_key
     """
-    def __init__(self, identity_key=None, signed_prekey=None, one_time_prekey=None, spk_signature=None):
+    def __init__(self, identity_key=None, signed_prekey=None, one_time_prekey=None):
         self.identity_key = identity_key or nacl.public.PrivateKey.generate()
         self.signed_prekey = signed_prekey or nacl.public.PrivateKey.generate()
-        self.one_time_prekey = one_time_prekey
-        # For real Signal, Ed25519 and X25519 keys are different keys derived from same seed
-        # Here, for demo, we use X25519 private key bytes to create a signing key
-        ik_bytes = bytes(self.identity_key)
-        signing_key = SigningKey(ik_bytes)
-        self.spk_signature = spk_signature or signing_key.sign(bytes(self.signed_prekey.public_key)).signature
+        self.one_time_prekey = one_time_prekey or nacl.public.PrivateKey.generate()
 
     def bundle_public(self):
-        bundle = {
+        return {
             "identity_key": bytes(self.identity_key.public_key),
             "signed_prekey": bytes(self.signed_prekey.public_key),
-            "spk_signature": self.spk_signature,
+            "one_time_prekey": bytes(self.one_time_prekey.public_key),
         }
-        if self.one_time_prekey:
-            bundle["one_time_prekey"] = bytes(self.one_time_prekey.public_key)
-        return bundle
 
     def serialize(self):
         return {
             "identity_key": bytes(self.identity_key).hex(),
             "signed_prekey": bytes(self.signed_prekey).hex(),
-            "spk_signature": self.spk_signature.hex(),
-            "one_time_prekey": bytes(self.one_time_prekey).hex() if self.one_time_prekey else None,
+            "one_time_prekey": bytes(self.one_time_prekey).hex(),
         }
 
     @classmethod
@@ -273,56 +262,41 @@ class X3DHKeyBundle(SerializableIface):
         return cls(
             identity_key=nacl.public.PrivateKey(bytes.fromhex(data["identity_key"])),
             signed_prekey=nacl.public.PrivateKey(bytes.fromhex(data["signed_prekey"])),
-            one_time_prekey=nacl.public.PrivateKey(bytes.fromhex(data["one_time_prekey"])) if data["one_time_prekey"] else None,
-            spk_signature=bytes.fromhex(data["spk_signature"]),
+            one_time_prekey=nacl.public.PrivateKey(bytes.fromhex(data["one_time_prekey"])),
         )
-
-def verify_spk_signature(identity_pub, signed_prekey, signature):
-    verify_key = VerifyKey(identity_pub)
-    verify_key.verify(signed_prekey, signature)
 
 def x3dh_initiate(sender_bundle, receiver_bundle):
     """
-    Perform X3DH key agreement (Signal style).
-    sender_bundle: X3DHKeyBundle for sender
-    receiver_bundle: dict with 'identity_key', 'signed_prekey', 'spk_signature', optional 'one_time_prekey'
-    Returns (root_key, ephemeral_privatekey, associated_data)
+    Perform X3DH key agreement.
+    sender_bundle: X3DHKeyBundle for the sender (initiator)
+    receiver_bundle: dict with 'identity_key', 'signed_prekey', 'one_time_prekey' public keys
+    Returns the shared secret (32 bytes) and the ephemeral key used.
     """
     ephemeral = nacl.public.PrivateKey.generate()
-    shared_secrets = []
-    # DH1: DH(IK_A, SPK_B)
-    shared_secrets.append(crypto_scalarmult(bytes(sender_bundle.identity_key), receiver_bundle['signed_prekey']))
-    # DH2: DH(EK_A, IK_B)
-    shared_secrets.append(crypto_scalarmult(bytes(ephemeral), receiver_bundle['identity_key']))
-    # DH3: DH(EK_A, SPK_B)
-    shared_secrets.append(crypto_scalarmult(bytes(ephemeral), receiver_bundle['signed_prekey']))
-    # DH4: DH(EK_A, OPK_B) if present
-    if 'one_time_prekey' in receiver_bundle and receiver_bundle['one_time_prekey']:
-        shared_secrets.append(crypto_scalarmult(bytes(ephemeral), receiver_bundle['one_time_prekey']))
-    shared_secret = b''.join(shared_secrets)
+    # DH1: DH(IK_sender, SPK_receiver)
+    DH1 = crypto_scalarmult(bytes(sender_bundle.identity_key), receiver_bundle['signed_prekey'])
+    # DH2: DH(EK_sender, IK_receiver)
+    DH2 = crypto_scalarmult(bytes(ephemeral), receiver_bundle['identity_key'])
+    # DH3: DH(EK_sender, SPK_receiver)
+    DH3 = crypto_scalarmult(bytes(ephemeral), receiver_bundle['signed_prekey'])
+    # DH4: DH(EK_sender, OPK_receiver)
+    DH4 = crypto_scalarmult(bytes(ephemeral), receiver_bundle['one_time_prekey'])
+    shared_secret = DH1 + DH2 + DH3 + DH4
     root_key = hkdf(shared_secret, 32, b"x3dh", b"X3DHv1", SHA256(), default_backend())
-    associated_data = receiver_bundle['identity_key'] + bytes(sender_bundle.identity_key.public_key)
-    return root_key, ephemeral, associated_data
+    return root_key, ephemeral
 
-def x3dh_receive(receiver_bundle, sender_identity_pub, ephemeral_pub, spk_signature):
-    # Verify the SPK signature
-    verify_spk_signature(bytes(receiver_bundle.identity_key.public_key),
-                         bytes(receiver_bundle.signed_prekey.public_key),
-                         spk_signature)
-    shared_secrets = []
-    # DH1: DH(SPK_B, IK_A)
-    shared_secrets.append(crypto_scalarmult(bytes(receiver_bundle.signed_prekey), sender_identity_pub))
-    # DH2: DH(IK_B, EK_A)
-    shared_secrets.append(crypto_scalarmult(bytes(receiver_bundle.identity_key), ephemeral_pub))
-    # DH3: DH(SPK_B, EK_A)
-    shared_secrets.append(crypto_scalarmult(bytes(receiver_bundle.signed_prekey), ephemeral_pub))
-    # DH4: DH(OPK_B, EK_A) if OPK
-    if receiver_bundle.one_time_prekey:
-        shared_secrets.append(crypto_scalarmult(bytes(receiver_bundle.one_time_prekey), ephemeral_pub))
-    shared_secret = b''.join(shared_secrets)
+def x3dh_receive(receiver_bundle, sender_identity_pub, ephemeral_pub):
+    # DH1: DH(SPK_receiver, IK_sender)
+    DH1 = crypto_scalarmult(bytes(receiver_bundle.signed_prekey), sender_identity_pub)
+    # DH2: DH(IK_receiver, EK_sender)
+    DH2 = crypto_scalarmult(bytes(receiver_bundle.identity_key), ephemeral_pub)
+    # DH3: DH(SPK_receiver, EK_sender)
+    DH3 = crypto_scalarmult(bytes(receiver_bundle.signed_prekey), ephemeral_pub)
+    # DH4: DH(OPK_receiver, EK_sender)
+    DH4 = crypto_scalarmult(bytes(receiver_bundle.one_time_prekey), ephemeral_pub)
+    shared_secret = DH1 + DH2 + DH3 + DH4
     root_key = hkdf(shared_secret, 32, b"x3dh", b"X3DHv1", SHA256(), default_backend())
-    associated_data = bytes(receiver_bundle.identity_key.public_key) + sender_identity_pub
-    return root_key, associated_data
+    return root_key
 
 # --- crypto/dhkey.py ---
 
@@ -345,6 +319,7 @@ class DHKeyPair(DHKeyPairIface):
     def dh_out(self, dh_pk):
         if not isinstance(dh_pk, DHPublicKey):
             raise TypeError("dh_pk must be of type: DHPublicKey")
+        # FIX: convert to bytes
         return crypto_scalarmult(bytes(self._private_key), bytes(dh_pk.public_key))
 
     def serialize(self):
