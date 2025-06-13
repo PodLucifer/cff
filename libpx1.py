@@ -255,7 +255,7 @@ def kdf_rk_he(rk: bytes, dh_out: bytes) -> Tuple[bytes, bytes, bytes]:
 def kdf_ck(ck: bytes) -> Tuple[bytes, bytes]:
     # Returns (next chain key, message key)
     if ck is None:
-        raise DoubleRatchetError("Chain key is None")
+        raise DoubleRatchetError("Chain key is None: CKs or CKr must be set before encrypt/decrypt. Check DoubleRatchet initialization and ratchet steps.")
     mk = hmac_sha256(ck, MSGKDF_INPUT)
     next_ck = hmac_sha256(ck, CHAINKDF_INPUT)
     return next_ck, mk
@@ -475,6 +475,9 @@ class DoubleRatchet(metaclass=abc.ABCMeta):
         Returns: (header, ciphertext) if header encryption is off,
                  (enc_header, ciphertext) if header encryption is on.
         """
+        # Defensive: ensure CKs is not None
+        if self.state.CKs is None:
+            raise DoubleRatchetError("Cannot encrypt: sending chain key (CKs) is None. Ratchet initialization may be incomplete.")
         if self.header_encryption:
             return self._encrypt_he(plaintext, ad)
         else:
@@ -512,6 +515,9 @@ class DoubleRatchet(metaclass=abc.ABCMeta):
         ad: associated data.
         Returns: plaintext
         """
+        # Defensive: ensure CKr is not None
+        if self.state.CKr is None:
+            raise DoubleRatchetError("Cannot decrypt: receiving chain key (CKr) is None. Ratchet initialization may be incomplete or this is out-of-order message before first ratchet.")
         if self.header_encryption:
             return self._decrypt_he(header, ciphertext, ad)
         else:
