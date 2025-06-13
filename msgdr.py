@@ -1,14 +1,3 @@
-"""
-libpx.py - InfinitePX1 Protocol Library
-
-Production-ready Python library for InfinitePX1, implementing XEdDSA/VXEdDSA, X3DH, Double Ratchet, and all supporting cryptography and store abstractions.
-
-No placeholders, no patchwork, no simulation: only concrete, real, production-ready implementations.
-
-Author: InfinitePX1 Protocol Contributors
-License: Public Domain / CC0
-"""
-
 import os
 import struct
 import typing
