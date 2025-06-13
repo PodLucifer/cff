@@ -13,6 +13,10 @@ from nacl.public import PrivateKey, PublicKey, Box
 from nacl.bindings import crypto_scalarmult
 from nacl.encoding import RawEncoder
 
+# --- Ed25519 for digital signatures ---
+from nacl.signing import SigningKey, VerifyKey
+from nacl.exceptions import BadSignatureError
+
 # -- Constants --
 MAX_SKIP = 1000
 AES_KEY_SIZE = 32
@@ -105,6 +109,73 @@ def generate_dh_keypair() -> Tuple[PrivateKey, PublicKey]:
 def dh(priv: PrivateKey, pub: PublicKey) -> bytes:
     # Returns raw X25519 scalar multiplication output (32 bytes)
     return crypto_scalarmult(priv.encode(RawEncoder), pub.encode(RawEncoder))
+
+# -- Ed25519 Digital Signatures (added section) --
+class Ed25519:
+    """
+    Utility class for Ed25519 digital signatures.
+    """
+
+    @staticmethod
+    def generate_keypair() -> Tuple[SigningKey, VerifyKey]:
+        """
+        Generate a new Ed25519 keypair.
+        Returns (signing_key, verify_key)
+        """
+        signing_key = SigningKey.generate()
+        verify_key = signing_key.verify_key
+        return signing_key, verify_key
+
+    @staticmethod
+    def sign(signing_key: SigningKey, message: bytes) -> bytes:
+        """
+        Sign the message using Ed25519.
+        Returns the signature (signature + message).
+        """
+        # nacl.signing signs and attaches the message, but we only want the signature
+        signed = signing_key.sign(message)
+        return signed.signature  # Just the signature (64 bytes)
+
+    @staticmethod
+    def verify(verify_key: VerifyKey, message: bytes, signature: bytes) -> bool:
+        """
+        Verify the message and signature using Ed25519.
+        Returns True if valid, False otherwise.
+        """
+        try:
+            # NaCl expects signature+message, but we split them
+            verify_key.verify(message, signature)
+            return True
+        except BadSignatureError:
+            return False
+
+    @staticmethod
+    def export_signing_key(signing_key: SigningKey) -> bytes:
+        """
+        Export the signing key as bytes.
+        """
+        return signing_key.encode()
+
+    @staticmethod
+    def import_signing_key(data: bytes) -> SigningKey:
+        """
+        Import a signing key from bytes.
+        """
+        return SigningKey(data)
+
+    @staticmethod
+    def export_verify_key(verify_key: VerifyKey) -> bytes:
+        """
+        Export the verify key as bytes.
+        """
+        return verify_key.encode()
+
+    @staticmethod
+    def import_verify_key(data: bytes) -> VerifyKey:
+        """
+        Import a verify key from bytes.
+        """
+        return VerifyKey(data)
 
 # -- KDF Chains --
 def kdf_rk(rk: bytes, dh_out: bytes) -> Tuple[bytes, bytes]:
