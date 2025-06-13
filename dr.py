@@ -1,0 +1,452 @@
+"""
+Highly custom, production-grade Double Ratchet Algorithm library for Python.
+Implements the Double Ratchet per the "Double Ratchet Algorithm" specification (Revision 1, 2016-11-20).
+- Uses X25519 (pynacl) for DH ratchet.
+- Uses HKDF-SHA256 (cryptography) for KDF chains.
+- Uses HMAC-SHA256 (cryptography) for message KDFs.
+- Uses AES-256-CBC+HMAC-SHA256 (cryptography) for AEAD (see spec).
+- Serialization via pickle.
+- No Alice/Bob logic; exposes a DoubleRatchet class for integration.
+- Supports header encryption variant.
+- Designed for production use, not simulation or placeholder/prototype.
+- Refer to the official spec and image1 for ratchet key/chain transitions.
+"""
+
+import os
+import abc
+import pickle
+from typing import Tuple, Optional, Dict, Any
+from collections import defaultdict
+
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.hashes import SHA256
+from cryptography.hazmat.primitives import hmac, hashes, padding
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+from nacl.public import PrivateKey, PublicKey, Box
+from nacl.bindings import crypto_scalarmult
+from nacl.encoding import RawEncoder
+
+# -- Constants --
+MAX_SKIP = 1000
+AES_KEY_SIZE = 32
+HMAC_KEY_SIZE = 32
+IV_SIZE = 16
+HEADER_KEY_SIZE = 32
+CHAIN_KEY_SIZE = 32
+ROOT_KEY_SIZE = 32
+MESSAGE_KEY_SIZE = 32
+
+MSGKDF_INPUT = b'\x01'
+CHAINKDF_INPUT = b'\x02'
+
+# Application-specific info for HKDF
+KDF_RK_INFO = b"DR:root"
+KDF_RK_HE_INFO = b"DR:root:he"
+KDF_AEAD_INFO = b"DR:aead"
+
+# -- Errors --
+class DoubleRatchetError(Exception): pass
+
+# -- Utility functions --
+def hkdf_sha256(salt: bytes, ikm: bytes, info: bytes, outlen: int) -> bytes:
+    return HKDF(
+        algorithm=SHA256(),
+        length=outlen,
+        salt=salt,
+        info=info,
+    ).derive(ikm)
+
+def hmac_sha256(key: bytes, data: bytes) -> bytes:
+    h = hmac.HMAC(key, SHA256())
+    h.update(data)
+    return h.finalize()
+
+def aes256_cbc_hmac_encrypt(key: bytes, plaintext: bytes, associated_data: bytes) -> bytes:
+    """
+    AEAD composed of:
+    - AES-256-CBC with PKCS#7 padding
+    - HMAC-SHA256 over (associated_data || ciphertext)
+    Output: IV || ciphertext || HMAC
+    """
+    out = hkdf_sha256(
+        salt=b"\x00" * 32,
+        ikm=key,
+        info=KDF_AEAD_INFO,
+        outlen=AES_KEY_SIZE + HMAC_KEY_SIZE + IV_SIZE
+    )
+    enc_key, auth_key, iv = out[:AES_KEY_SIZE], out[AES_KEY_SIZE:AES_KEY_SIZE+HMAC_KEY_SIZE], out[AES_KEY_SIZE+HMAC_KEY_SIZE:]
+    padder = padding.PKCS7(128).padder()
+    padded = padder.update(plaintext) + padder.finalize()
+    cipher = Cipher(algorithms.AES(enc_key), modes.CBC(iv))
+    encryptor = cipher.encryptor()
+    ct = encryptor.update(padded) + encryptor.finalize()
+    mac = hmac_sha256(auth_key, associated_data + ct)[:16]  # Truncate HMAC to 128 bits
+    return iv + ct + mac
+
+def aes256_cbc_hmac_decrypt(key: bytes, ciphertext: bytes, associated_data: bytes) -> bytes:
+    out = hkdf_sha256(
+        salt=b"\x00" * 32,
+        ikm=key,
+        info=KDF_AEAD_INFO,
+        outlen=AES_KEY_SIZE + HMAC_KEY_SIZE + IV_SIZE
+    )
+    enc_key, auth_key, iv = out[:AES_KEY_SIZE], out[AES_KEY_SIZE:AES_KEY_SIZE+HMAC_KEY_SIZE], out[AES_KEY_SIZE+HMAC_KEY_SIZE:]
+    if len(ciphertext) < IV_SIZE + 16:
+        raise DoubleRatchetError("Ciphertext too short")
+    ct = ciphertext[IV_SIZE:-16]
+    tag = ciphertext[-16:]
+    if hmac_sha256(auth_key, associated_data + ct)[:16] != tag:
+        raise DoubleRatchetError("Authentication failed")
+    cipher = Cipher(algorithms.AES(enc_key), modes.CBC(iv))
+    decryptor = cipher.decryptor()
+    padded = decryptor.update(ct) + decryptor.finalize()
+    unpadder = padding.PKCS7(128).unpadder()
+    return unpadder.update(padded) + unpadder.finalize()
+
+# -- Diffie-Hellman primitives (X25519) --
+def generate_dh_keypair() -> Tuple[PrivateKey, PublicKey]:
+    priv = PrivateKey.generate()
+    return priv, priv.public_key
+
+def dh(priv: PrivateKey, pub: PublicKey) -> bytes:
+    # Returns raw X25519 scalar multiplication output (32 bytes)
+    return crypto_scalarmult(priv.encode(RawEncoder), pub.encode(RawEncoder))
+
+# -- KDF Chains --
+def kdf_rk(rk: bytes, dh_out: bytes) -> Tuple[bytes, bytes]:
+    # Derive (root_key, chain_key) from root_key and DH output
+    okm = hkdf_sha256(rk, dh_out, KDF_RK_INFO, ROOT_KEY_SIZE + CHAIN_KEY_SIZE)
+    return okm[:ROOT_KEY_SIZE], okm[ROOT_KEY_SIZE:]
+
+def kdf_rk_he(rk: bytes, dh_out: bytes) -> Tuple[bytes, bytes, bytes]:
+    # For header encryption variant: (root_key, chain_key, next_header_key)
+    okm = hkdf_sha256(rk, dh_out, KDF_RK_HE_INFO, ROOT_KEY_SIZE + CHAIN_KEY_SIZE + HEADER_KEY_SIZE)
+    return okm[:ROOT_KEY_SIZE], okm[ROOT_KEY_SIZE:ROOT_KEY_SIZE+CHAIN_KEY_SIZE], okm[ROOT_KEY_SIZE+CHAIN_KEY_SIZE:]
+
+def kdf_ck(ck: bytes) -> Tuple[bytes, bytes]:
+    # Returns (next chain key, message key)
+    if ck is None:
+        raise DoubleRatchetError("Chain key is None")
+    mk = hmac_sha256(ck, MSGKDF_INPUT)
+    next_ck = hmac_sha256(ck, CHAINKDF_INPUT)
+    return next_ck, mk
+
+# -- Header encoding/decoding --
+class Header:
+    def __init__(self, dh_pub: bytes, pn: int, n: int):
+        self.dh = dh_pub  # bytes (public key)
+        self.pn = pn      # int
+        self.n = n        # int
+
+    def serialize(self) -> bytes:
+        # Simple serialization: pubkey(32) || pn(4) || n(4)
+        return self.dh + self.pn.to_bytes(4, 'big') + self.n.to_bytes(4, 'big')
+
+    @staticmethod
+    def deserialize(data: bytes) -> "Header":
+        if len(data) < 32 + 4 + 4:
+            raise DoubleRatchetError("Header too short")
+        dh = data[:32]
+        pn = int.from_bytes(data[32:36], 'big')
+        n = int.from_bytes(data[36:40], 'big')
+        return Header(dh, pn, n)
+
+    def __repr__(self):
+        return f"<Header dh={self.dh.hex()} pn={self.pn} n={self.n}>"
+
+def concat_ad(ad: bytes, header: Header) -> bytes:
+    # Prepend AD length (4 bytes) so parseable
+    adlen = len(ad).to_bytes(4, 'big')
+    return adlen + ad + header.serialize()
+
+# -- AEAD wrappers --
+def encrypt(mk: bytes, plaintext: bytes, associated_data: bytes) -> bytes:
+    return aes256_cbc_hmac_encrypt(mk, plaintext, associated_data)
+
+def decrypt(mk: bytes, ciphertext: bytes, associated_data: bytes) -> bytes:
+    return aes256_cbc_hmac_decrypt(mk, ciphertext, associated_data)
+
+# -- Header encryption (AEAD) --
+def h_encrypt(hk: bytes, header: Header) -> bytes:
+    # Use header key to encrypt serialized header, associated_data is empty
+    return aes256_cbc_hmac_encrypt(hk, header.serialize(), b'')
+
+def h_decrypt(hk: Optional[bytes], enc_header: bytes) -> Optional[Header]:
+    if hk is None:
+        return None
+    try:
+        plaintext = aes256_cbc_hmac_decrypt(hk, enc_header, b'')
+        return Header.deserialize(plaintext)
+    except Exception:
+        return None
+
+# -- Double Ratchet State --
+class DoubleRatchetState:
+    """
+    Core state for a Double Ratchet participant.
+    """
+    def __init__(self):
+        # DH ratchet keys (private and public)
+        self.DHs: Optional[PrivateKey] = None
+        self.DHs_pub: Optional[PublicKey] = None
+        self.DHr: Optional[bytes] = None  # remote public key (bytes)
+        # Root, chain keys
+        self.RK: Optional[bytes] = None
+        self.CKs: Optional[bytes] = None
+        self.CKr: Optional[bytes] = None
+        # Message numbers
+        self.Ns = 0
+        self.Nr = 0
+        self.PN = 0
+        # Skipped message keys
+        self.MKSKIPPED: Dict[Tuple[bytes, int], bytes] = {}
+        # Header encryption keys (optional)
+        self.HKs: Optional[bytes] = None
+        self.HKr: Optional[bytes] = None
+        self.NHKs: Optional[bytes] = None
+        self.NHKr: Optional[bytes] = None
+
+    def serialize(self) -> bytes:
+        # Pickle is used for simple state serialization
+        return pickle.dumps(self, protocol=pickle.HIGHEST_PROTOCOL)
+
+    @staticmethod
+    def deserialize(data: bytes) -> "DoubleRatchetState":
+        return pickle.loads(data)
+
+# -- Double Ratchet (main API) --
+class DoubleRatchet(metaclass=abc.ABCMeta):
+    """
+    Double Ratchet algorithm: stateful, production-grade implementation.
+    - Can be initialized from a shared secret/root key and remote's DH public key.
+    - Exposes encrypt() and decrypt() methods for message processing.
+    - Optionally supports header encryption.
+    - Does NOT maintain any network/transport; you must store and transmit headers/ciphertexts as needed.
+    """
+
+    def __init__(self, *, root_key: bytes, dh_pair: Optional[PrivateKey] = None,
+                 dh_remote_pub: Optional[bytes] = None, header_keys: Optional[Dict[str, bytes]] = None,
+                 skip_header_encryption: bool = False):
+        """
+        - root_key: Initial root key (32 bytes, from X3DH or equivalent).
+        - dh_pair: Our initial DH private key (X25519, or None to generate).
+        - dh_remote_pub: Remote's DH public key (bytes).
+        - header_keys: Dict for header encryption: {'HKs':..., 'NHKs':..., 'HKr':..., 'NHKr':...}
+        - skip_header_encryption: If True, header encryption is not used.
+        """
+        self.state = DoubleRatchetState()
+        self.header_encryption = not skip_header_encryption
+        # Initial setup: if header_encryption is used, require header_keys
+        if self.header_encryption:
+            # Header encryption variant
+            self._init_header_encryption(root_key, dh_pair, dh_remote_pub, header_keys)
+        else:
+            self._init_plain(root_key, dh_pair, dh_remote_pub)
+
+    def _init_plain(self, root_key, dh_pair, dh_remote_pub):
+        # Standard Double Ratchet (no header encryption)
+        if dh_pair is None:
+            self.state.DHs, self.state.DHs_pub = generate_dh_keypair()
+        else:
+            self.state.DHs = dh_pair
+            self.state.DHs_pub = dh_pair.public_key
+        if dh_remote_pub is None:
+            raise ValueError("Remote DH public key required for initialization")
+        self.state.DHr = dh_remote_pub
+        rk, cks = kdf_rk(root_key, dh(self.state.DHs, PublicKey(dh_remote_pub)))
+        self.state.RK = rk
+        self.state.CKs = cks
+        self.state.CKr = None
+        self.state.Ns = 0
+        self.state.Nr = 0
+        self.state.PN = 0
+        self.state.MKSKIPPED = {}
+
+    def _init_header_encryption(self, root_key, dh_pair, dh_remote_pub, header_keys):
+        # Header encryption variant (requires header_keys)
+        if not header_keys or not all(k in header_keys for k in ('HKs', 'NHKs', 'HKr', 'NHKr')):
+            raise ValueError("Header keys required for header encryption variant")
+        if dh_pair is None:
+            self.state.DHs, self.state.DHs_pub = generate_dh_keypair()
+        else:
+            self.state.DHs = dh_pair
+            self.state.DHs_pub = dh_pair.public_key
+        if dh_remote_pub is None:
+            raise ValueError("Remote DH public key required for initialization")
+        self.state.DHr = dh_remote_pub
+        rk, cks, nhks = kdf_rk_he(root_key, dh(self.state.DHs, PublicKey(dh_remote_pub)))
+        self.state.RK = rk
+        self.state.CKs = cks
+        self.state.CKr = None
+        self.state.Ns = 0
+        self.state.Nr = 0
+        self.state.PN = 0
+        self.state.MKSKIPPED = {}
+        self.state.HKs = header_keys['HKs']
+        self.state.NHKs = nhks
+        self.state.HKr = header_keys['HKr']
+        self.state.NHKr = header_keys['NHKr']
+
+    def encrypt(self, plaintext: bytes, ad: bytes = b'') -> Tuple[bytes, bytes]:
+        """
+        Encrypts a message.
+        Returns: (header, ciphertext) if header encryption is off,
+                 (enc_header, ciphertext) if header encryption is on.
+        """
+        if self.header_encryption:
+            return self._encrypt_he(plaintext, ad)
+        else:
+            return self._encrypt_plain(plaintext, ad)
+
+    def _encrypt_plain(self, plaintext: bytes, ad: bytes) -> Tuple[bytes, bytes]:
+        self.state.CKs, mk = kdf_ck(self.state.CKs)
+        header = Header(self.state.DHs_pub.encode(RawEncoder), self.state.PN, self.state.Ns)
+        out_header = header.serialize()
+        self.state.Ns += 1
+        ct = encrypt(mk, plaintext, concat_ad(ad, header))
+        return out_header, ct
+
+    def _encrypt_he(self, plaintext: bytes, ad: bytes) -> Tuple[bytes, bytes]:
+        self.state.CKs, mk = kdf_ck(self.state.CKs)
+        header = Header(self.state.DHs_pub.encode(RawEncoder), self.state.PN, self.state.Ns)
+        enc_header = h_encrypt(self.state.HKs, header)
+        self.state.Ns += 1
+        ct = encrypt(mk, plaintext, concat_ad(ad, enc_header))
+        return enc_header, ct
+
+    def decrypt(self, header: bytes, ciphertext: bytes, ad: bytes = b'') -> bytes:
+        """
+        Decrypts a message.
+        header: raw or encrypted header, depending on mode.
+        ciphertext: encrypted message.
+        ad: associated data.
+        Returns: plaintext
+        """
+        if self.header_encryption:
+            return self._decrypt_he(header, ciphertext, ad)
+        else:
+            return self._decrypt_plain(header, ciphertext, ad)
+
+    def _decrypt_plain(self, header_bytes: bytes, ciphertext: bytes, ad: bytes) -> bytes:
+        header = Header.deserialize(header_bytes)
+        # Step 1: Try skipped message keys
+        pt = self._try_skipped_message_keys((header.dh, header.n), ciphertext, concat_ad(ad, header))
+        if pt is not None:
+            return pt
+        # Step 2: DH ratchet step if new key received
+        if header.dh != (self.state.DHr if self.state.DHr else b''):
+            self._skip_message_keys(header.pn)
+            self._dh_ratchet(header)
+        self._skip_message_keys(header.n)
+        self.state.CKr, mk = kdf_ck(self.state.CKr)
+        self.state.Nr += 1
+        return decrypt(mk, ciphertext, concat_ad(ad, header))
+
+    def _decrypt_he(self, enc_header: bytes, ciphertext: bytes, ad: bytes) -> bytes:
+        # Step 1: Try skipped message keys for header encryption
+        pt = self._try_skipped_message_keys_he(enc_header, ciphertext, ad)
+        if pt is not None:
+            return pt
+        header, dh_ratchet = self._decrypt_header(enc_header)
+        if dh_ratchet:
+            self._skip_message_keys_he(header.pn)
+            self._dh_ratchet_he(header)
+        self._skip_message_keys_he(header.n)
+        self.state.CKr, mk = kdf_ck(self.state.CKr)
+        self.state.Nr += 1
+        return decrypt(mk, ciphertext, concat_ad(ad, enc_header))
+
+    # -- Skipped message key logic --
+    def _try_skipped_message_keys(self, key: Tuple[bytes, int], ciphertext: bytes, ad: bytes) -> Optional[bytes]:
+        if key in self.state.MKSKIPPED:
+            mk = self.state.MKSKIPPED[key]
+            del self.state.MKSKIPPED[key]
+            return decrypt(mk, ciphertext, ad)
+        return None
+
+    def _skip_message_keys(self, until: int):
+        if self.state.Nr + MAX_SKIP < until:
+            raise DoubleRatchetError("Too many skipped message keys")
+        if self.state.CKr is not None:
+            while self.state.Nr < until:
+                self.state.CKr, mk = kdf_ck(self.state.CKr)
+                self.state.MKSKIPPED[(self.state.DHr, self.state.Nr)] = mk
+                self.state.Nr += 1
+
+    # -- DH ratchet step (plain) --
+    def _dh_ratchet(self, header: Header):
+        self.state.PN = self.state.Ns
+        self.state.Ns = 0
+        self.state.Nr = 0
+        self.state.DHr = header.dh
+        self.state.RK, self.state.CKr = kdf_rk(self.state.RK, dh(self.state.DHs, PublicKey(self.state.DHr)))
+        self.state.DHs, self.state.DHs_pub = generate_dh_keypair()
+        self.state.RK, self.state.CKs = kdf_rk(self.state.RK, dh(self.state.DHs, PublicKey(self.state.DHr)))
+
+    # -- Header encryption skipped keys --
+    def _try_skipped_message_keys_he(self, enc_header: bytes, ciphertext: bytes, ad: bytes) -> Optional[bytes]:
+        for (hk, n), mk in list(self.state.MKSKIPPED.items()):
+            header = h_decrypt(hk, enc_header)
+            if header is not None and header.n == n:
+                del self.state.MKSKIPPED[(hk, n)]
+                return decrypt(mk, ciphertext, concat_ad(ad, enc_header))
+        return None
+
+    def _skip_message_keys_he(self, until: int):
+        if self.state.Nr + MAX_SKIP < until:
+            raise DoubleRatchetError("Too many skipped message keys")
+        if self.state.CKr is not None:
+            while self.state.Nr < until:
+                self.state.CKr, mk = kdf_ck(self.state.CKr)
+                self.state.MKSKIPPED[(self.state.HKr, self.state.Nr)] = mk
+                self.state.Nr += 1
+
+    def _decrypt_header(self, enc_header: bytes) -> Tuple[Header, bool]:
+        header = h_decrypt(self.state.HKr, enc_header)
+        if header is not None:
+            return header, False
+        header = h_decrypt(self.state.NHKr, enc_header)
+        if header is not None:
+            return header, True
+        raise DoubleRatchetError("Header decryption failed")
+
+    # -- DH ratchet step (header encryption) --
+    def _dh_ratchet_he(self, header: Header):
+        self.state.PN = self.state.Ns
+        self.state.Ns = 0
+        self.state.Nr = 0
+        self.state.HKs = self.state.NHKs
+        self.state.HKr = self.state.NHKr
+        self.state.DHr = header.dh
+        self.state.RK, self.state.CKr, self.state.NHKr = kdf_rk_he(self.state.RK, dh(self.state.DHs, PublicKey(self.state.DHr)))
+        self.state.DHs, self.state.DHs_pub = generate_dh_keypair()
+        self.state.RK, self.state.CKs, self.state.NHKs = kdf_rk_he(self.state.RK, dh(self.state.DHs, PublicKey(self.state.DHr)))
+
+    # -- Export/import state for persistence --
+    def export_state(self) -> bytes:
+        return self.state.serialize()
+
+    def import_state(self, data: bytes):
+        self.state = DoubleRatchetState.deserialize(data)
+
+    # -- For test/debug, not for production use --
+    def dump_state(self) -> Dict[str, Any]:
+        return {
+            "DHs": self.state.DHs.encode(RawEncoder).hex() if self.state.DHs else None,
+            "DHs_pub": self.state.DHs_pub.encode(RawEncoder).hex() if self.state.DHs_pub else None,
+            "DHr": self.state.DHr.hex() if self.state.DHr else None,
+            "RK": self.state.RK.hex() if self.state.RK else None,
+            "CKs": self.state.CKs.hex() if self.state.CKs else None,
+            "CKr": self.state.CKr.hex() if self.state.CKr else None,
+            "Ns": self.state.Ns,
+            "Nr": self.state.Nr,
+            "PN": self.state.PN,
+            "MKSKIPPED": { (k[0].hex(), k[1]) : v.hex() for k, v in self.state.MKSKIPPED.items() },
+            "HKs": self.state.HKs.hex() if self.state.HKs else None,
+            "HKr": self.state.HKr.hex() if self.state.HKr else None,
+            "NHKs": self.state.NHKs.hex() if self.state.NHKs else None,
+            "NHKr": self.state.NHKr.hex() if self.state.NHKr else None,
+        }
+
+# End of dr.py
