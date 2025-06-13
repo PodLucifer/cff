@@ -23,6 +23,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.backends import default_backend
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 
 X25519_PRIVATE_KEY_SIZE = 32
 X25519_PUBLIC_KEY_SIZE = 32
@@ -440,7 +441,94 @@ class X3DH:
         SK = X3DH.kdf(KM, info, salt=b'\x00' * 32)
         return SK
 
-class DoubleRatchetState:
+# --- Begin: Double Ratchet (Extended/Combined) ---
+
+class MaxSkippedMksExceeded(Exception):
+    pass
+
+class MsgKeyStorage:
+    EVENT_THRESH = 5
+
+    def __init__(self, skipped_mks=None, event_count=0):
+        if skipped_mks:
+            if not isinstance(skipped_mks, OrderedDict):
+                raise TypeError("skipped_mks must be of type: OrderedDict")
+            self._skipped_mks = skipped_mks
+        else:
+            self._skipped_mks = OrderedDict()
+
+        if not isinstance(event_count, int):
+            raise TypeError("event_count must be of type: int")
+        if event_count < 0:
+            raise ValueError("event_count must be positive")
+        self._event_count = event_count
+
+    def front(self):
+        return next(iter(self._skipped_mks))
+
+    def lookup(self, key):
+        return self._skipped_mks.get(key, None)
+
+    def put(self, key, value):
+        self._skipped_mks[key] = value
+
+    def delete(self, key):
+        del self._skipped_mks[key]
+
+    def count(self):
+        return len(self._skipped_mks)
+
+    def items(self):
+        return self._skipped_mks.items()
+
+    def notify_event(self):
+        if len(self._skipped_mks) == 0:
+            self._event_count = 0
+            return
+
+        self._event_count = (self._event_count + 1) % MsgKeyStorage.EVENT_THRESH
+        if self._event_count == 0:
+            self._skipped_mks.popitem(last=False)
+
+class Header:
+    INT_ENCODE_BYTES = 4
+    KEY_LEN = X25519_PUBLIC_KEY_SIZE
+
+    def __init__(self, dh_pk: bytes, prev_chain_len: int, msg_no: int):
+        self._dh_pk = dh_pk
+        self._prev_chain_len = prev_chain_len
+        self._msg_no = msg_no
+
+    def __bytes__(self):
+        header_bytes = self._dh_pk
+        header_bytes += self._prev_chain_len.to_bytes(Header.INT_ENCODE_BYTES, byteorder='little')
+        header_bytes += self._msg_no.to_bytes(Header.INT_ENCODE_BYTES, byteorder='little')
+        return header_bytes
+
+    @classmethod
+    def from_bytes(cls, header_bytes):
+        if not isinstance(header_bytes, bytes):
+            raise TypeError("header_bytes must be of type: bytes")
+        if header_bytes is None or len(header_bytes) != Header.KEY_LEN + 2 * Header.INT_ENCODE_BYTES:
+            raise ValueError("Invalid header length")
+        dh_pk = header_bytes[:Header.KEY_LEN]
+        prev_chain_len = int.from_bytes(header_bytes[Header.KEY_LEN:-Header.INT_ENCODE_BYTES], byteorder='little')
+        msg_no = int.from_bytes(header_bytes[-Header.INT_ENCODE_BYTES:], byteorder='little')
+        return cls(dh_pk, prev_chain_len, msg_no)
+
+    @property
+    def dh_pk(self):
+        return self._dh_pk
+
+    @property
+    def prev_chain_len(self):
+        return self._prev_chain_len
+
+    @property
+    def msg_no(self):
+        return self._msg_no
+
+class DoubleRatchetStateCombined:
     def __init__(self):
         self.DHs: x25519.X25519PrivateKey = KeyHelper.generate_x25519_key_pair()
         self.DHr: Optional[x25519.X25519PublicKey] = None
@@ -450,9 +538,26 @@ class DoubleRatchetState:
         self.Ns: int = 0
         self.Nr: int = 0
         self.PN: int = 0
-        self.MKSKIPPED: Dict[Tuple[bytes, int], bytes] = {}
+        self.MKSKIPPED: MsgKeyStorage = MsgKeyStorage()
 
-class DoubleRatchet:
+def hkdf_combined(key, length, salt, info, algorithm=hashes.SHA256(), backend=default_backend()):
+    hkdf_obj = HKDF(
+        algorithm=algorithm,
+        length=length,
+        salt=salt,
+        info=info,
+        backend=backend
+    )
+    return hkdf_obj.derive(key)
+
+def hmac_combined(key, data, algorithm=hashes.SHA256(), backend=default_backend()):
+    h = hmac.new(key, data, algorithm().name)
+    return h.digest()
+
+class DoubleRatchetCombined:
+    MAX_SKIP = 1000
+    MAX_STORE = 2000
+
     @staticmethod
     def kdf_rk(rk: bytes, dh_out: bytes) -> Tuple[bytes, bytes]:
         hkdf = HKDF(
@@ -463,6 +568,7 @@ class DoubleRatchet:
             backend=default_backend()
         ).derive(ByteUtil.concat(rk, dh_out))
         return hkdf[:32], hkdf[32:]
+
     @staticmethod
     def kdf_ck(ck: bytes) -> Tuple[bytes, bytes]:
         hkdf = HKDF(
@@ -473,51 +579,72 @@ class DoubleRatchet:
             backend=default_backend()
         ).derive(ck)
         return hkdf[:32], hkdf[32:64]
+
     @staticmethod
-    def encrypt(state: DoubleRatchetState, plaintext: bytes, ad: bytes) -> Tuple[bytes, bytes]:
-        state.CKs, mk = DoubleRatchet.kdf_ck(state.CKs)
+    def encrypt(state: DoubleRatchetStateCombined, plaintext: str, ad: bytes) -> Tuple[bytes, bytes]:
+        if not isinstance(plaintext, str):
+            raise TypeError("plaintext must be of type: string")
+        state.CKs, mk = DoubleRatchetCombined.kdf_ck(state.CKs)
         nonce = secrets.token_bytes(CHACHA20_NONCE_SIZE)
         cipher = ChaCha20Poly1305(mk)
-        header = struct.pack("!I", state.PN) + state.DHs.public_key().public_bytes(
+        header = Header(
+            state.DHs.public_key().public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw
+            ),
+            state.PN,
+            state.Ns
+        )
+        ciphertext = cipher.encrypt(nonce, plaintext.encode("utf-8"), ByteUtil.concat(ad, bytes(header)))
+        state.Ns += 1
+        return bytes(header) + nonce, ciphertext
+
+    @staticmethod
+    def decrypt(state: DoubleRatchetStateCombined, header_bytes: bytes, ciphertext: bytes, ad: bytes) -> str:
+        header = Header.from_bytes(header_bytes[:Header.KEY_LEN + 8])
+        nonce = header_bytes[Header.KEY_LEN + 8:Header.KEY_LEN + 8 + CHACHA20_NONCE_SIZE]
+        dh_pub = x25519.X25519PublicKey.from_public_bytes(header.dh_pk)
+        if state.DHr is None or dh_pub.public_bytes(
             encoding=serialization.Encoding.Raw,
             format=serialization.PublicFormat.Raw
-        )
-        ciphertext = cipher.encrypt(nonce, plaintext, ByteUtil.concat(ad, header))
-        state.Ns += 1
-        return header + nonce, ciphertext
-    @staticmethod
-    def decrypt(state: DoubleRatchetState, header: bytes, ciphertext: bytes, ad: bytes) -> bytes:
-        pn = struct.unpack("!I", header[:4])[0]
-        dh_pub = x25519.X25519PublicKey.from_public_bytes(header[4:36])
-        nonce = header[36:48]
-        if dh_pub != state.DHr:
-            DoubleRatchet.skip_message_keys(state, pn)
-            DoubleRatchet.dh_ratchet(state, dh_pub)
-        DoubleRatchet.skip_message_keys(state, pn)
-        state.CKr, mk = DoubleRatchet.kdf_ck(state.CKr)
+        ) != state.DHr.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw
+        ):
+            DoubleRatchetCombined.skip_message_keys(state, header.msg_no)
+            DoubleRatchetCombined.dh_ratchet(state, dh_pub)
+        DoubleRatchetCombined.skip_message_keys(state, header.msg_no)
+        state.CKr, mk = DoubleRatchetCombined.kdf_ck(state.CKr)
         state.Nr += 1
         cipher = ChaCha20Poly1305(mk)
-        return cipher.decrypt(nonce, ciphertext, ByteUtil.concat(ad, header))
+        pt_bytes = cipher.decrypt(nonce, ciphertext, ByteUtil.concat(ad, header_bytes[:Header.KEY_LEN + 8]))
+        return pt_bytes.decode("utf-8")
+
     @staticmethod
-    def skip_message_keys(state: DoubleRatchetState, until: int):
-        if state.Nr + MAX_SKIP < until:
+    def skip_message_keys(state: DoubleRatchetStateCombined, until: int):
+        if state.Nr + DoubleRatchetCombined.MAX_SKIP < until:
             raise InvalidMessageException("Too many skipped message keys")
         if state.CKr:
             while state.Nr < until:
-                state.CKr, mk = DoubleRatchet.kdf_ck(state.CKr)
-                state.MKSKIPPED[(state.DHr.public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw), state.Nr)] = mk
+                state.CKr, mk = DoubleRatchetCombined.kdf_ck(state.CKr)
+                state.MKSKIPPED.put((state.DHr.public_bytes(
+                    encoding=serialization.Encoding.Raw,
+                    format=serialization.PublicFormat.Raw), state.Nr), mk)
                 state.Nr += 1
+
     @staticmethod
-    def dh_ratchet(state: DoubleRatchetState, header_dh: x25519.X25519PublicKey):
+    def dh_ratchet(state: DoubleRatchetStateCombined, header_dh: x25519.X25519PublicKey):
         state.PN = state.Ns
         state.Ns = 0
         state.Nr = 0
         state.DHr = header_dh
-        rk, ckr = DoubleRatchet.kdf_rk(state.RK, state.DHs.exchange(state.DHr))
+        rk, ckr = DoubleRatchetCombined.kdf_rk(state.RK, state.DHs.exchange(state.DHr))
         state.RK, state.CKr = rk, ckr
         state.DHs = KeyHelper.generate_x25519_key_pair()
-        rk, cks = DoubleRatchet.kdf_rk(state.RK, state.DHs.exchange(state.DHr))
+        rk, cks = DoubleRatchetCombined.kdf_rk(state.RK, state.DHs.exchange(state.DHr))
         state.RK, state.CKs = rk, cks
+
+# --- End: Double Ratchet (Extended/Combined) ---
 
 class AESCipher:
     @staticmethod
