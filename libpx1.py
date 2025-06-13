@@ -406,7 +406,7 @@ class DoubleRatchet(metaclass=abc.ABCMeta):
 
     def __init__(self, *, root_key: bytes, dh_pair: Optional[PrivateKey] = None,
                  dh_remote_pub: Optional[bytes] = None, header_keys: Optional[Dict[str, bytes]] = None,
-                 skip_header_encryption: bool = False):
+                 skip_header_encryption: bool = True):  # <---- CHANGED: default skip_header_encryption to True
         """
         - root_key: Initial root key (32 bytes, from X3DH or equivalent).
         - dh_pair: Our initial DH private key (X25519, or None to generate).
