@@ -1,444 +1,528 @@
+from __future__ import absolute_import
+
 import os
-import struct
-import typing
-import hmac
-import hashlib
-import secrets
-from typing import Optional, Tuple, Dict, Any, List, Union
-from cryptography.hazmat.primitives.asymmetric import x25519, ed25519
-from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305, AESGCM
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.backends import default_backend
-from abc import ABC, abstractmethod
+import pickle
 from collections import OrderedDict
+from abc import ABC, abstractmethod
 
-X25519_PRIVATE_KEY_SIZE = 32
-X25519_PUBLIC_KEY_SIZE = 32
-ED25519_SIGNATURE_SIZE = 64
-AESGCM_KEY_SIZE = 32
-AESGCM_NONCE_SIZE = 12
-CHACHA20_NONCE_SIZE = 12
-CHAIN_KEY_SIZE = 32
-MESSAGE_KEY_SIZE = 32
-ROOT_KEY_SIZE = 32
-MAX_SKIP = 1000
+# --- interfaces/serializable.py ---
 
-class ByteUtil:
-    @staticmethod
-    def to_bytes(val: int, length: int) -> bytes:
-        return val.to_bytes(length, 'little')
-    @staticmethod
-    def from_bytes(data: bytes) -> int:
-        return int.from_bytes(data, 'little')
-    @staticmethod
-    def concat(*args: bytes) -> bytes:
-        return b''.join(args)
-    @staticmethod
-    def secure_random_bytes(length: int) -> bytes:
-        return secrets.token_bytes(length)
-    @staticmethod
-    def to_hex(data: bytes) -> str:
-        return data.hex()
-    @staticmethod
-    def xor_bytes(a: bytes, b: bytes) -> bytes:
-        return bytes(x ^ y for x, y in zip(a, b))
-
-class InvalidKeyException(Exception): pass
-class UntrustedIdentityException(Exception): pass
-class InvalidMessageException(Exception): pass
-class DuplicateMessageException(Exception): pass
-
-class Logger:
-    @staticmethod
-    def debug(msg: str): pass
-    @staticmethod
-    def info(msg: str): pass
-    @staticmethod
-    def warn(msg: str): pass
-    @staticmethod
-    def error(msg: str): pass
-
-class IdentityKey:
-    def __init__(self, private: ed25519.Ed25519PrivateKey):
-        self._private = private
-        self._public = private.public_key()
-    @property
-    def public_bytes(self) -> bytes:
-        return self._public.public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw)
-    @property
-    def private_bytes(self) -> bytes:
-        return self._private.private_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PrivateFormat.Raw,
-            encryption_algorithm=serialization.NoEncryption())
-    def sign(self, data: bytes) -> bytes:
-        return self._private.sign(data)
-    def verify(self, signature: bytes, data: bytes) -> bool:
-        try:
-            self._public.verify(signature, data)
-            return True
-        except Exception:
-            return False
-
-class IdentityKeyPair:
-    def __init__(self, private: ed25519.Ed25519PrivateKey):
-        self.private = private
-        self.public = private.public_key()
-    @staticmethod
-    def generate():
-        private = ed25519.Ed25519PrivateKey.generate()
-        return IdentityKeyPair(private)
-
-class PreKeyRecord:
-    def __init__(self, id: int, key_pair: x25519.X25519PrivateKey):
-        self.id = id
-        self.private = key_pair
-        self.public = key_pair.public_key()
-
-class SignedPreKeyRecord:
-    def __init__(self, id: int, key_pair: x25519.X25519PrivateKey, signature: bytes):
-        self.id = id
-        self.private = key_pair
-        self.public = key_pair.public_key()
-        self.signature = signature
-
-class KeyHelper:
-    @staticmethod
-    def generate_x25519_key_pair() -> x25519.X25519PrivateKey:
-        return x25519.X25519PrivateKey.generate()
-    @staticmethod
-    def generate_ed25519_key_pair() -> ed25519.Ed25519PrivateKey:
-        return ed25519.Ed25519PrivateKey.generate()
-    @staticmethod
-    def generate_prekey(id: int) -> PreKeyRecord:
-        return PreKeyRecord(id, KeyHelper.generate_x25519_key_pair())
-    @staticmethod
-    def generate_signed_prekey(id: int, identity_key: ed25519.Ed25519PrivateKey) -> SignedPreKeyRecord:
-        prekey = KeyHelper.generate_x25519_key_pair()
-        signature = identity_key.sign(
-            prekey.public_key().public_bytes(
-                encoding=serialization.Encoding.Raw,
-                format=serialization.PublicFormat.Raw
-            )
-        )
-        return SignedPreKeyRecord(id, prekey, signature)
-
-class WhisperMessage:
-    def __init__(self, ciphertext: bytes, mac: bytes):
-        self.ciphertext = ciphertext
-        self.mac = mac
-
-class PreKeyWhisperMessage:
-    def __init__(self, registration_id: int, prekey_id: int, signed_prekey_id: int, base_key: bytes, identity_key: bytes, message: WhisperMessage):
-        self.registration_id = registration_id
-        self.prekey_id = prekey_id
-        self.signed_prekey_id = signed_prekey_id
-        self.base_key = base_key
-        self.identity_key = identity_key
-        self.message = message
-
-class SignalMessage:
-    def __init__(self, ciphertext: bytes, ratchet_header: bytes, mac: bytes):
-        self.ciphertext = ciphertext
-        self.ratchet_header = ratchet_header
-        self.mac = mac
-
-class SenderKeyMessage:
-    def __init__(self, iteration: int, chain_id: int, ciphertext: bytes, mac: bytes):
-        self.iteration = iteration
-        self.chain_id = chain_id
-        self.ciphertext = ciphertext
-        self.mac = mac
-
-class SenderMessageKey:
-    def __init__(self, iteration: int, seed: bytes):
-        self.iteration = iteration
-        self.seed = seed
-
-class SenderChainKey:
-    def __init__(self, iteration: int, key: bytes):
-        self.iteration = iteration
-        self.key = key
-
-class ChainKey:
-    def __init__(self, key: bytes, index: int):
-        self.key = key
-        self.index = index
-    def next(self) -> 'ChainKey':
-        new_key = hmac.new(self.key, b'ChainKey', hashlib.sha256).digest()
-        return ChainKey(new_key, self.index + 1)
-    def get_message_key(self) -> bytes:
-        return hmac.new(self.key, b'MessageKey', hashlib.sha256).digest()
-
-class MessageKeys:
-    def __init__(self, cipher_key: bytes, mac_key: bytes, iv: bytes):
-        self.cipher_key = cipher_key
-        self.mac_key = mac_key
-        self.iv = iv
-
-class RootKey:
-    def __init__(self, key: bytes):
-        self.key = key
-    def create_chain(self, dh_out: bytes) -> Tuple['RootKey', ChainKey]:
-        hkdf = HKDF(
-            algorithm=hashes.SHA256(),
-            length=64,
-            salt=None,
-            info=b'RootKey',
-            backend=default_backend()
-        ).derive(ByteUtil.concat(self.key, dh_out))
-        return RootKey(hkdf[:32]), ChainKey(hkdf[32:], 0)
-
-class RatchetingSession:
-    def __init__(self):
-        self.root_key: Optional[RootKey] = None
-        self.chain_key: Optional[ChainKey] = None
-        self.ratchet_private: Optional[x25519.X25519PrivateKey] = None
-        self.ratchet_public: Optional[x25519.X25519PublicKey] = None
-        self.ratchet_remote_public: Optional[x25519.X25519PublicKey] = None
-    def initialize(self, root_key: RootKey, remote_public: x25519.X25519PublicKey):
-        self.root_key = root_key
-        self.ratchet_private = KeyHelper.generate_x25519_key_pair()
-        self.ratchet_public = self.ratchet_private.public_key()
-        self.ratchet_remote_public = remote_public
-        dh_out = self.ratchet_private.exchange(remote_public)
-        self.root_key, self.chain_key = self.root_key.create_chain(dh_out)
-
-class SessionCipher:
-    def __init__(self, session_record: 'SessionRecord'):
-        self.session_record = session_record
-    def encrypt(self, plaintext: bytes, associated_data: bytes = b'') -> WhisperMessage:
-        mk = self.session_record.chain_key.get_message_key()
-        cipher = ChaCha20Poly1305(mk[:32])
-        nonce = secrets.token_bytes(CHACHA20_NONCE_SIZE)
-        ciphertext = cipher.encrypt(nonce, plaintext, associated_data)
-        mac = hmac.new(mk, ciphertext, hashlib.sha256).digest()
-        return WhisperMessage(ciphertext, mac)
-    def decrypt(self, message: WhisperMessage, associated_data: bytes = b'') -> bytes:
-        mk = self.session_record.chain_key.get_message_key()
-        cipher = ChaCha20Poly1305(mk[:32])
-        plaintext = cipher.decrypt(message.ciphertext[:CHACHA20_NONCE_SIZE], message.ciphertext[CHACHA20_NONCE_SIZE:], associated_data)
-        mac = hmac.new(mk, message.ciphertext, hashlib.sha256).digest()
-        if not hmac.compare_digest(mac, message.mac):
-            raise InvalidMessageException("MAC verification failed")
-        return plaintext
-
-class SessionRecord:
-    def __init__(self):
-        self.chain_key: Optional[ChainKey] = None
-        self.root_key: Optional[RootKey] = None
-
-class SessionBuilder:
-    def __init__(self, session_store: 'SessionStore', prekey_store: 'PreKeyStore', signed_prekey_store: 'SignedPreKeyStore', identity_store: 'IdentityKeyStore'):
-        self.session_store = session_store
-        self.prekey_store = prekey_store
-        self.signed_prekey_store = signed_prekey_store
-        self.identity_store = identity_store
-    def build_session(self, remote_identity_key: bytes, remote_base_key: bytes, prekey_id: int, signed_prekey_id: int):
+class SerializableIface(ABC):
+    @abstractmethod
+    def serialize(self):
         pass
 
-class SessionStore(ABC):
+    @classmethod
     @abstractmethod
-    def load_session(self, identifier: str) -> Optional[SessionRecord]: pass
-    @abstractmethod
-    def store_session(self, identifier: str, record: SessionRecord): pass
+    def deserialize(cls, serialized_obj):
+        pass
 
-class PreKeyStore(ABC):
-    @abstractmethod
-    def load_prekey(self, prekey_id: int) -> Optional[PreKeyRecord]: pass
-    @abstractmethod
-    def store_prekey(self, prekey_id: int, prekey: PreKeyRecord): pass
+# --- interfaces/aead.py ---
 
-class SignedPreKeyStore(ABC):
-    @abstractmethod
-    def load_signed_prekey(self, signed_prekey_id: int) -> Optional[SignedPreKeyRecord]: pass
-    @abstractmethod
-    def store_signed_prekey(self, signed_prekey_id: int, signed_prekey: SignedPreKeyRecord): pass
-
-class IdentityKeyStore(ABC):
-    @abstractmethod
-    def load_identity_key(self, identifier: str) -> Optional[IdentityKey]: pass
-    @abstractmethod
-    def store_identity_key(self, identifier: str, identity_key: IdentityKey): pass
-
-class SenderKeyStore(ABC):
-    @abstractmethod
-    def load_sender_key(self, group_id: str) -> Optional[SenderKeyMessage]: pass
-    @abstractmethod
-    def store_sender_key(self, group_id: str, sender_key: SenderKeyMessage): pass
-
-def xeddsa_calculate_key_pair(k: int, curve_order: int, base_point):
-    E = base_point * k
-    signbit = 0
-    if E[1] & 1:
-        a = (-k) % curve_order
-    else:
-        a = k % curve_order
-    return E, a
-
-def u_to_y(u: int, p: int) -> int:
-    return ((u - 1) * pow(u + 1, -1, p)) % p
-
-def mont_to_ed_point(u: int, p: int) -> Tuple[int, int]:
-    y = u_to_y(u, p)
-    return (0, y)
-
-def hash_bytes(data: bytes, domain: bytes = b"") -> int:
-    return int.from_bytes(hashlib.sha512(domain + data).digest(), "little")
-
-class XEdDSA:
+class AEADIFace(ABC):
     @staticmethod
-    def sign(mont_priv: x25519.X25519PrivateKey, message: bytes, random64: bytes) -> bytes:
-        k_bytes = mont_priv.private_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PrivateFormat.Raw,
-            encryption_algorithm=serialization.NoEncryption(),
-        )
-        k = int.from_bytes(k_bytes, "little")
-        # curve25519 params
-        p = 2**255 - 19
-        q = 2**252 + 27742317777372353535851937790883648493
-        B = 9
-        E, a = xeddsa_calculate_key_pair(k, q, B)
-        a_bytes = a.to_bytes(32, "little")
-        r = hash_bytes(a_bytes + message + random64, b"\xfe") % q
-        R = (B * r) % p
-        R_bytes = R.to_bytes(32, "little")
-        A_bytes = E[1].to_bytes(32, "little")
-        h = hash_bytes(R_bytes + A_bytes + message, b"") % q
-        s = (r + h * a) % q
-        s_bytes = s.to_bytes(32, "little")
-        signature = R_bytes + s_bytes
-        return signature
+    @abstractmethod
+    def encrypt(key, pt, associated_data = None):
+        pass
 
     @staticmethod
-    def verify(mont_pub: x25519.X25519PublicKey, message: bytes, signature: bytes) -> bool:
-        p = 2**255 - 19
-        q = 2**252 + 27742317777372353535851937790883648493
-        u = int.from_bytes(
-            mont_pub.public_bytes(
-                encoding=serialization.Encoding.Raw,
-                format=serialization.PublicFormat.Raw
-            ), "little"
-        )
-        R_bytes = signature[:32]
-        s_bytes = signature[32:]
-        R = int.from_bytes(R_bytes, "little")
-        s = int.from_bytes(s_bytes, "little")
-        if u >= p or R >= 2**255 or s >= 2**253:
-            return False
-        A = mont_to_ed_point(u, p)
-        A_bytes = A[1].to_bytes(32, "little")
-        h = hash_bytes(R_bytes + A_bytes + message, b"") % q
-        Rcheck = (pow(9, s, p) - h * A[1]) % p
-        return R == Rcheck
+    @abstractmethod
+    def decrypt(key, ct, associated_data = None):
+        pass
 
-class VXEdDSA:
+# --- interfaces/dhkey.py ---
+
+class DHKeyPairIface(SerializableIface):
+    @classmethod
+    @abstractmethod
+    def generate_dh(cls):
+        pass
+
+    @abstractmethod
+    def dh_out(self, dh_pk):
+        pass
+
+    @property
+    @abstractmethod
+    def private_key(self):
+        pass
+
+    @property
+    @abstractmethod
+    def public_key(self):
+        pass
+
+class DHPublicKeyIface(SerializableIface):
+    @abstractmethod
+    def pk_bytes(self):
+        pass
+
+    @abstractmethod
+    def is_equal_to(self, dh_pk):
+        pass
+
+    @classmethod
+    @abstractmethod
+    def from_bytes(cls, pk_bytes):
+        pass
+
+    @property
+    @abstractmethod
+    def public_key(self):
+        pass
+
+# --- interfaces/kdfchain.py ---
+
+class KDFChainIface(SerializableIface):
+    @property
+    @abstractmethod
+    def ck(self):
+        pass
+
+    @ck.setter
+    @abstractmethod
+    def ck(self, val):
+        pass
+
+class SymmetricChainIface(KDFChainIface):
+    @abstractmethod
+    def ratchet(self):
+        pass
+
+    @property
+    @abstractmethod
+    def msg_no(self):
+        pass
+
+    @msg_no.setter
+    @abstractmethod
+    def msg_no(self, val):
+        pass
+
+class RootChainIface(KDFChainIface):
+    @abstractmethod
+    def ratchet(self, dh_out):
+        pass
+
+# --- interfaces/keystorage.py ---
+
+class MsgKeyStorageIface(SerializableIface):
+    @abstractmethod
+    def front(self):
+        pass
+
+    @abstractmethod
+    def lookup(self, key):
+        pass
+
+    @abstractmethod
+    def put(self, key, value):
+        pass
+
+    @abstractmethod
+    def delete(self, key):
+        pass
+
+    @abstractmethod
+    def count(self):
+        pass
+
+    @abstractmethod
+    def items(self):
+        pass
+
+    @abstractmethod
+    def notify_event(self):
+        pass
+
+# --- interfaces/ratchet.py ---
+
+class RatchetIface(ABC):
     @staticmethod
-    def sign(mont_priv: x25519.X25519PrivateKey, message: bytes, random64: bytes) -> Tuple[bytes, bytes]:
-        k_bytes = mont_priv.private_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PrivateFormat.Raw,
-            encryption_algorithm=serialization.NoEncryption(),
-        )
-        k = int.from_bytes(k_bytes, "little")
-        p = 2**255 - 19
-        q = 2**252 + 27742317777372353535851937790883648493
-        B = 9
-        E, a = xeddsa_calculate_key_pair(k, q, B)
-        a_bytes = a.to_bytes(32, "little")
-        Bv = hash_bytes(a_bytes + message, b"\xfd") % q
-        V = (a * Bv) % p
-        V_bytes = V.to_bytes(32, "little")
-        r = hash_bytes(a_bytes + V_bytes + random64, b"\xfc") % q
-        R = (B * r) % p
-        Rv = (Bv * r) % p
-        R_bytes = R.to_bytes(32, "little")
-        Rv_bytes = Rv.to_bytes(32, "little")
-        h = hash_bytes(a_bytes + V_bytes + R_bytes + Rv_bytes + message, b"\xfb") % q
-        s = (r + h * a) % q
-        s_bytes = s.to_bytes(32, "little")
-        v = hash_bytes(V_bytes, b"\xfa") % (2**256)
-        return V_bytes + h.to_bytes(32, "little") + s_bytes, v.to_bytes(32, "little")
+    @abstractmethod
+    def encrypt_message(state, pt, associated_data, aead):
+        pass
 
     @staticmethod
-    def verify(mont_pub: x25519.X25519PublicKey, message: bytes, signature: bytes) -> Optional[bytes]:
-        p = 2**255 - 19
-        q = 2**252 + 27742317777372353535851937790883648493
-        u = int.from_bytes(
-            mont_pub.public_bytes(
-                encoding=serialization.Encoding.Raw,
-                format=serialization.PublicFormat.Raw
-            ), "little"
-        )
-        V_bytes = signature[:32]
-        h_bytes = signature[32:64]
-        s_bytes = signature[64:]
-        V = int.from_bytes(V_bytes, "little")
-        h = int.from_bytes(h_bytes, "little")
-        s = int.from_bytes(s_bytes, "little")
-        if u >= p or V >= 2**255 or h >= 2**253 or s >= 2**253:
-            return False
-        A = mont_to_ed_point(u, p)
-        Bv = hash_bytes(A[1].to_bytes(32, "little") + message, b"\xfd") % q
-        R = (pow(9, s, p) - h * A[1]) % p
-        Rv = (pow(Bv, s, p) - h * V) % p
-        hcheck = hash_bytes(
-            A[1].to_bytes(32, "little") + V_bytes + R.to_bytes(32, "little") + Rv.to_bytes(32, "little") + message, b"\xfb"
-        ) % q
-        if h == hcheck:
-            v = hash_bytes(V_bytes, b"\xfa") % (2**256)
-            return v.to_bytes(32, "little")
-        return None
+    @abstractmethod
+    def decrypt_message(state, msg, associated_data, aead, keypair):
+        pass
 
-class X3DH:
-    @staticmethod
-    def dh(priv: x25519.X25519PrivateKey, pub: x25519.X25519PublicKey) -> bytes:
-        return priv.exchange(pub)
-    @staticmethod
-    def kdf(key_material: bytes, info: bytes, salt: Optional[bytes] = None, length: int = 32) -> bytes:
-        hkdf = HKDF(
-            algorithm=hashes.SHA256(),
-            length=length,
-            salt=salt,
-            info=info,
-            backend=default_backend()
-        )
-        return hkdf.derive(key_material)
-    @staticmethod
-    def run_x3dh(
-        IKA_priv: x25519.X25519PrivateKey,
-        EKA_priv: x25519.X25519PrivateKey,
-        IKB_pub: x25519.X25519PublicKey,
-        SPKB_pub: x25519.X25519PublicKey,
-        OPKB_pub: Optional[x25519.X25519PublicKey],
-        signed_prekey_signature: bytes,
-        info: bytes
-    ) -> bytes:
-        dh1 = X3DH.dh(IKA_priv, SPKB_pub)
-        dh2 = X3DH.dh(EKA_priv, IKB_pub)
-        dh3 = X3DH.dh(EKA_priv, SPKB_pub)
-        dhs = [dh1, dh2, dh3]
-        if OPKB_pub:
-            dh4 = X3DH.dh(EKA_priv, OPKB_pub)
-            dhs.append(dh4)
-        KM = b''.join(dhs)
-        SK = X3DH.kdf(KM, info, salt=b'\x00' * 32)
-        return SK
+# --- crypto/utils.py (needed by aead) ---
 
-# --- Begin: Double Ratchet (Extended/Combined) ---
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes, hmac as crypto_hmac
 
-class MaxSkippedMksExceeded(Exception):
+def hkdf(key, length, salt, info, algorithm, backend):
+    hkdf_obj = HKDF(
+        algorithm=algorithm,
+        length=length,
+        salt=salt,
+        info=info,
+        backend=backend
+    )
+    return hkdf_obj.derive(key)
+
+def hmac(key, data, algorithm, backend):
+    h = crypto_hmac.HMAC(key, algorithm, backend=backend)
+    h.update(data)
+    return h.finalize()
+
+def hmac_verify(key, data, algorithm, backend, tag):
+    h = crypto_hmac.HMAC(key, algorithm, backend=backend)
+    h.update(data)
+    h.verify(tag)
+
+# --- crypto/aead.py ---
+
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.hashes import SHA256
+from cryptography.exceptions import InvalidSignature
+
+class AuthenticationFailed(Exception):
     pass
 
-class MsgKeyStorage:
+class AES256GCM(AEADIFace):
+    KEY_LEN = 32
+    IV_LEN = 12  # Standard for GCM
+
+    @staticmethod
+    def encrypt(key, pt, associated_data = None):
+        if not isinstance(key, bytes):
+            raise TypeError("key must be of type: bytes")
+        if not len(key) == AES256GCM.KEY_LEN:
+            raise ValueError("key must be 32 bytes")
+        if not isinstance(pt, bytes):
+            raise TypeError("pt must be of type: bytes")
+        if associated_data and not isinstance(associated_data, bytes):
+            raise TypeError("associated_data must be of type: bytes")
+
+        aesgcm = AESGCM(key)
+        iv = os.urandom(AES256GCM.IV_LEN)
+        ct = aesgcm.encrypt(iv, pt, associated_data)
+        return ct + iv
+
+    @staticmethod
+    def decrypt(key, ct, associated_data = None):
+        if not isinstance(key, bytes):
+            raise TypeError("key must be of type: bytes")
+        if not len(key) == AES256GCM.KEY_LEN:
+            raise ValueError("key must be 32 bytes")
+        if not isinstance(ct, bytes):
+            raise TypeError("ct must be of type: bytes")
+        if associated_data and not isinstance(associated_data, bytes):
+            raise TypeError("associated_data must be of type: bytes")
+
+        aesgcm = AESGCM(key)
+        iv = ct[-AES256GCM.IV_LEN:]
+        try:
+            pt = aesgcm.decrypt(iv, ct[:-AES256GCM.IV_LEN], associated_data)
+        except InvalidSignature:
+            raise AuthenticationFailed("Invalid ciphertext")
+        return pt
+
+# --- crypto/x3dh.py (PyNaCl, like Signal) ---
+
+import nacl.public
+import nacl.utils
+from nacl.bindings import crypto_scalarmult
+from nacl.signing import SigningKey, VerifyKey
+
+class X3DHError(Exception):
+    pass
+
+class X3DHKeyBundle(SerializableIface):
+    """
+    Represents a user's X3DH bundle:
+      - identity_key: long-term X25519 keypair
+      - signed_prekey: medium-term X25519 keypair
+      - one_time_prekey: short-term X25519 keypair (optional)
+      - spk_signature: Ed25519 signature (bytes) of signed_prekey by identity_key
+    """
+    def __init__(self, identity_key=None, signed_prekey=None, one_time_prekey=None, spk_signature=None):
+        self.identity_key = identity_key or nacl.public.PrivateKey.generate()
+        self.signed_prekey = signed_prekey or nacl.public.PrivateKey.generate()
+        self.one_time_prekey = one_time_prekey
+        # For real Signal, Ed25519 and X25519 keys are different keys derived from same seed
+        # Here, for demo, we use X25519 private key bytes to create a signing key
+        ik_bytes = bytes(self.identity_key)
+        signing_key = SigningKey(ik_bytes)
+        self.spk_signature = spk_signature or signing_key.sign(bytes(self.signed_prekey.public_key)).signature
+
+    def bundle_public(self):
+        bundle = {
+            "identity_key": bytes(self.identity_key.public_key),
+            "signed_prekey": bytes(self.signed_prekey.public_key),
+            "spk_signature": self.spk_signature,
+        }
+        if self.one_time_prekey:
+            bundle["one_time_prekey"] = bytes(self.one_time_prekey.public_key)
+        return bundle
+
+    def serialize(self):
+        return {
+            "identity_key": bytes(self.identity_key).hex(),
+            "signed_prekey": bytes(self.signed_prekey).hex(),
+            "spk_signature": self.spk_signature.hex(),
+            "one_time_prekey": bytes(self.one_time_prekey).hex() if self.one_time_prekey else None,
+        }
+
+    @classmethod
+    def deserialize(cls, data):
+        return cls(
+            identity_key=nacl.public.PrivateKey(bytes.fromhex(data["identity_key"])),
+            signed_prekey=nacl.public.PrivateKey(bytes.fromhex(data["signed_prekey"])),
+            one_time_prekey=nacl.public.PrivateKey(bytes.fromhex(data["one_time_prekey"])) if data["one_time_prekey"] else None,
+            spk_signature=bytes.fromhex(data["spk_signature"]),
+        )
+
+def verify_spk_signature(identity_pub, signed_prekey, signature):
+    verify_key = VerifyKey(identity_pub)
+    verify_key.verify(signed_prekey, signature)
+
+def x3dh_initiate(sender_bundle, receiver_bundle):
+    """
+    Perform X3DH key agreement (Signal style).
+    sender_bundle: X3DHKeyBundle for sender
+    receiver_bundle: dict with 'identity_key', 'signed_prekey', 'spk_signature', optional 'one_time_prekey'
+    Returns (root_key, ephemeral_privatekey, associated_data)
+    """
+    ephemeral = nacl.public.PrivateKey.generate()
+    shared_secrets = []
+    # DH1: DH(IK_A, SPK_B)
+    shared_secrets.append(crypto_scalarmult(bytes(sender_bundle.identity_key), receiver_bundle['signed_prekey']))
+    # DH2: DH(EK_A, IK_B)
+    shared_secrets.append(crypto_scalarmult(bytes(ephemeral), receiver_bundle['identity_key']))
+    # DH3: DH(EK_A, SPK_B)
+    shared_secrets.append(crypto_scalarmult(bytes(ephemeral), receiver_bundle['signed_prekey']))
+    # DH4: DH(EK_A, OPK_B) if present
+    if 'one_time_prekey' in receiver_bundle and receiver_bundle['one_time_prekey']:
+        shared_secrets.append(crypto_scalarmult(bytes(ephemeral), receiver_bundle['one_time_prekey']))
+    shared_secret = b''.join(shared_secrets)
+    root_key = hkdf(shared_secret, 32, b"x3dh", b"X3DHv1", SHA256(), default_backend())
+    associated_data = receiver_bundle['identity_key'] + bytes(sender_bundle.identity_key.public_key)
+    return root_key, ephemeral, associated_data
+
+def x3dh_receive(receiver_bundle, sender_identity_pub, ephemeral_pub, spk_signature):
+    # Verify the SPK signature
+    verify_spk_signature(bytes(receiver_bundle.identity_key.public_key),
+                         bytes(receiver_bundle.signed_prekey.public_key),
+                         spk_signature)
+    shared_secrets = []
+    # DH1: DH(SPK_B, IK_A)
+    shared_secrets.append(crypto_scalarmult(bytes(receiver_bundle.signed_prekey), sender_identity_pub))
+    # DH2: DH(IK_B, EK_A)
+    shared_secrets.append(crypto_scalarmult(bytes(receiver_bundle.identity_key), ephemeral_pub))
+    # DH3: DH(SPK_B, EK_A)
+    shared_secrets.append(crypto_scalarmult(bytes(receiver_bundle.signed_prekey), ephemeral_pub))
+    # DH4: DH(OPK_B, EK_A) if OPK
+    if receiver_bundle.one_time_prekey:
+        shared_secrets.append(crypto_scalarmult(bytes(receiver_bundle.one_time_prekey), ephemeral_pub))
+    shared_secret = b''.join(shared_secrets)
+    root_key = hkdf(shared_secret, 32, b"x3dh", b"X3DHv1", SHA256(), default_backend())
+    associated_data = bytes(receiver_bundle.identity_key.public_key) + sender_identity_pub
+    return root_key, associated_data
+
+# --- crypto/dhkey.py ---
+
+class DHKeyPair(DHKeyPairIface):
+    """X25519 via PyNaCl"""
+    KEY_LEN = 32
+    def __init__(self, sk = None):
+        if sk:
+            if not isinstance(sk, nacl.public.PrivateKey):
+                raise TypeError("sk must be nacl.public.PrivateKey")
+            self._private_key = sk
+        else:
+            self._private_key = nacl.public.PrivateKey.generate()
+        self._public_key = self._private_key.public_key
+
+    @classmethod
+    def generate_dh(cls):
+        return cls(nacl.public.PrivateKey.generate())
+
+    def dh_out(self, dh_pk):
+        if not isinstance(dh_pk, DHPublicKey):
+            raise TypeError("dh_pk must be of type: DHPublicKey")
+        return crypto_scalarmult(bytes(self._private_key), bytes(dh_pk.public_key))
+
+    def serialize(self):
+        return {
+            "private_key": bytes(self._private_key).hex(),
+            "public_key": bytes(self._public_key).hex()
+        }
+
+    @classmethod
+    def deserialize(cls, data):
+        private_key = nacl.public.PrivateKey(bytes.fromhex(data["private_key"]))
+        return cls(private_key)
+
+    @property
+    def private_key(self):
+        return self._private_key
+
+    @property
+    def public_key(self):
+        return DHPublicKey(self._public_key)
+
+class DHPublicKey(DHPublicKeyIface):
+    KEY_LEN = 32
+    def __init__(self, public_key):
+        if not isinstance(public_key, nacl.public.PublicKey):
+            raise TypeError("public_key must be nacl.public.PublicKey")
+        self._public_key = public_key
+
+    def pk_bytes(self):
+        return bytes(self._public_key)
+
+    def is_equal_to(self, dh_pk):
+        if not isinstance(dh_pk, DHPublicKey):
+            raise TypeError("dh_pk must be DHPublicKey")
+        return self.pk_bytes() == dh_pk.pk_bytes()
+
+    @classmethod
+    def from_bytes(cls, pk_bytes_val):
+        if not isinstance(pk_bytes_val, bytes):
+            raise TypeError("pk_bytes must be bytes")
+        if not len(pk_bytes_val) == DHPublicKey.KEY_LEN:
+            raise ValueError("pk_bytes must be 32 bytes")
+        return cls(nacl.public.PublicKey(pk_bytes_val))
+
+    @property
+    def public_key(self):
+        return self._public_key
+
+    def serialize(self):
+        return {
+            "public_key": bytes(self._public_key).hex()
+        }
+
+    @classmethod
+    def deserialize(cls, data):
+        return cls(nacl.public.PublicKey(bytes.fromhex(data["public_key"])))
+
+# --- crypto/kdfchain.py ---
+
+class SymmetricChain(SymmetricChainIface):
+    def __init__(self, ck = None, msg_no = None):
+        if ck:
+            if not isinstance(ck, bytes):
+                raise TypeError("ck must be of type: bytes")
+            self._ck = ck
+        else:
+            self._ck = None
+
+        if msg_no:
+            if not isinstance(msg_no, int):
+                raise TypeError("msg_no must be of type: int")
+            if msg_no < 0:
+                raise ValueError("msg_no  must be positive")
+            self._msg_no = msg_no
+        else:
+            self._msg_no = 0
+
+    def ratchet(self):
+        if self._ck is None:
+            raise ValueError("ck is not initialized")
+        mk = hmac(self._ck, b"mk_ratchet", SHA256(), default_backend())
+        self._ck = hmac(self._ck, b"ck_ratchet", SHA256(), default_backend())
+        return mk
+
+    def serialize(self):
+        return {
+            "ck" : self._ck,
+            "msg_no" : self._msg_no
+        }
+
+    @classmethod
+    def deserialize(cls, serialized_chain):
+        if not isinstance(serialized_chain, dict):
+            raise TypeError("serialized_chain must be of type: dict")
+        return cls(serialized_chain["ck"], serialized_chain["msg_no"])
+
+    @property
+    def ck(self):
+        return self._ck
+
+    @ck.setter
+    def ck(self, val):
+        self._ck = val
+
+    @property
+    def msg_no(self):
+        return self._msg_no
+
+    @msg_no.setter
+    def msg_no(self, val):
+        self._msg_no = val
+
+class RootChain(RootChainIface):
+    KEY_LEN = 32
+    DEFAULT_OUTPUTS = 1
+
+    def __init__(self, ck = None):
+        if ck:
+            if not isinstance(ck, bytes):
+                raise TypeError("ck must be of type: bytes")
+            if not len(ck) == RootChain.KEY_LEN:
+                raise ValueError("ck must be 32 bytes")
+            self._ck = ck
+        else:
+            self._ck = None
+
+    def ratchet(self, dh_out, outputs = DEFAULT_OUTPUTS):
+        if not isinstance(dh_out, bytes):
+            raise TypeError("dh_out must be of type: bytes")
+        if not isinstance(outputs, int):
+            raise TypeError("outputs must be of type: int")
+        if outputs < 0:
+            raise ValueError("outputs must be positive")
+        if self._ck is None:
+            raise ValueError("ck is not initialized")
+
+        hkdf_out = hkdf(
+            dh_out,
+            RootChain.KEY_LEN * (outputs + 1),
+            self._ck,
+            b"rk_ratchet",
+            SHA256(),
+            default_backend()
+        )
+
+        self._rk = hkdf_out[-RootChain.KEY_LEN:]
+
+        keys = []
+        for i in range(0, outputs):
+            keys.append(hkdf_out[i * RootChain.KEY_LEN:(i + 1) * RootChain.KEY_LEN])
+
+        return keys
+
+    def serialize(self):
+        return {
+            "ck" : self._ck
+        }
+
+    @classmethod
+    def deserialize(cls, serialized_chain):
+        if not isinstance(serialized_chain, dict):
+            raise TypeError("serialized_chain must be of type: dict")
+        return cls(serialized_chain["ck"])
+
+    @property
+    def ck(self):
+        return self._ck
+
+    @ck.setter
+    def ck(self, val):
+        self._ck = val
+
+# --- keystorage.py ---
+
+class MsgKeyStorage(MsgKeyStorageIface):
     EVENT_THRESH = 5
 
-    def __init__(self, skipped_mks=None, event_count=0):
+    def __init__(self, skipped_mks = None, event_count = 0):
         if skipped_mks:
             if not isinstance(skipped_mks, OrderedDict):
                 raise TypeError("skipped_mks must be of type: OrderedDict")
@@ -456,7 +540,9 @@ class MsgKeyStorage:
         return next(iter(self._skipped_mks))
 
     def lookup(self, key):
-        return self._skipped_mks.get(key, None)
+        if key not in self._skipped_mks:
+            return None
+        return self._skipped_mks[key]
 
     def put(self, key, value):
         self._skipped_mks[key] = value
@@ -477,32 +563,73 @@ class MsgKeyStorage:
 
         self._event_count = (self._event_count + 1) % MsgKeyStorage.EVENT_THRESH
         if self._event_count == 0:
-            self._skipped_mks.popitem(last=False)
+            del self._skipped_mks[self.front()]
+
+    def serialize(self):
+        return {
+            "skipped_mks": dict(self._skipped_mks),
+            "event_count": self._event_count
+        }
+
+    @classmethod
+    def deserialize(cls, serialized_dict):
+        if not isinstance(serialized_dict, dict):
+            raise TypeError("serialized_dict must be of type: dict")
+
+        return cls(
+            OrderedDict(serialized_dict["skipped_mks"]),
+            serialized_dict["event_count"]
+        )
+
+# --- message.py ---
 
 class Header:
     INT_ENCODE_BYTES = 4
-    KEY_LEN = X25519_PUBLIC_KEY_SIZE
 
-    def __init__(self, dh_pk: bytes, prev_chain_len: int, msg_no: int):
+    def __init__(self, dh_pk, prev_chain_len, msg_no):
+        if not isinstance(dh_pk, DHPublicKey):
+            raise TypeError("dh_pk must be of type: DHPublicKey")
+        if not isinstance(prev_chain_len, int):
+            raise TypeError("prev_chain_len must be of type: int")
+        if prev_chain_len < 0:
+            raise ValueError("prev_chain_len must be positive")
+        if not isinstance(msg_no, int):
+            raise TypeError("msg_no must be of type: int")
+        if msg_no < 0:
+            raise ValueError("msg_no must be positive")
+
         self._dh_pk = dh_pk
         self._prev_chain_len = prev_chain_len
         self._msg_no = msg_no
 
     def __bytes__(self):
-        header_bytes = self._dh_pk
-        header_bytes += self._prev_chain_len.to_bytes(Header.INT_ENCODE_BYTES, byteorder='little')
-        header_bytes += self._msg_no.to_bytes(Header.INT_ENCODE_BYTES, byteorder='little')
+        header_bytes = self._dh_pk.pk_bytes()
+        header_bytes += self._prev_chain_len.to_bytes(
+            Header.INT_ENCODE_BYTES,
+            byteorder='little'
+        )
+        header_bytes += self._msg_no.to_bytes(
+            Header.INT_ENCODE_BYTES,
+            byteorder='little'
+        )
         return header_bytes
 
     @classmethod
     def from_bytes(cls, header_bytes):
         if not isinstance(header_bytes, bytes):
             raise TypeError("header_bytes must be of type: bytes")
-        if header_bytes is None or len(header_bytes) != Header.KEY_LEN + 2 * Header.INT_ENCODE_BYTES:
-            raise ValueError("Invalid header length")
-        dh_pk = header_bytes[:Header.KEY_LEN]
-        prev_chain_len = int.from_bytes(header_bytes[Header.KEY_LEN:-Header.INT_ENCODE_BYTES], byteorder='little')
-        msg_no = int.from_bytes(header_bytes[-Header.INT_ENCODE_BYTES:], byteorder='little')
+        if header_bytes is None or \
+            len(header_bytes) != DHPublicKey.KEY_LEN + 2 * Header.INT_ENCODE_BYTES:
+            raise ValueError("Inva")
+        dh_pk = DHPublicKey.from_bytes(header_bytes[:DHPublicKey.KEY_LEN])
+        prev_chain_len = int.from_bytes(
+            header_bytes[DHPublicKey.KEY_LEN:-Header.INT_ENCODE_BYTES],
+            byteorder='little'
+        )
+        msg_no = int.from_bytes(
+            header_bytes[-Header.INT_ENCODE_BYTES:],
+            byteorder='little'
+        )
         return cls(dh_pk, prev_chain_len, msg_no)
 
     @property
@@ -517,146 +644,471 @@ class Header:
     def msg_no(self):
         return self._msg_no
 
-class DoubleRatchetStateCombined:
-    def __init__(self):
-        self.DHs: x25519.X25519PrivateKey = KeyHelper.generate_x25519_key_pair()
-        self.DHr: Optional[x25519.X25519PublicKey] = None
-        self.RK: bytes = secrets.token_bytes(ROOT_KEY_SIZE)
-        self.CKs: Optional[bytes] = None
-        self.CKr: Optional[bytes] = None
-        self.Ns: int = 0
-        self.Nr: int = 0
-        self.PN: int = 0
-        self.MKSKIPPED: MsgKeyStorage = MsgKeyStorage()
+class Message:
+    def __init__(self, header, ct):
+        if not isinstance(header, Header):
+            raise TypeError("header must be of type: Header")
+        if not isinstance(ct, bytes):
+            raise TypeError("ct must be of type: bytes")
+        self._header = header
+        self._ct = ct
 
-def hkdf_combined(key, length, salt, info, algorithm=hashes.SHA256(), backend=default_backend()):
-    hkdf_obj = HKDF(
-        algorithm=algorithm,
-        length=length,
-        salt=salt,
-        info=info,
-        backend=backend
-    )
-    return hkdf_obj.derive(key)
+    @property
+    def header(self):
+        return self._header
 
-def hmac_combined(key, data, algorithm=hashes.SHA256(), backend=default_backend()):
-    h = hmac.new(key, data, algorithm().name)
-    return h.digest()
+    @property
+    def ct(self):
+        return self._ct
 
-class DoubleRatchetCombined:
+class MessageHE:
+    def __init__(self, header_ct, ct):
+        if not isinstance(header_ct, bytes):
+            raise TypeError("header_ct must be of type: bytes")
+        if not isinstance(ct, bytes):
+            raise TypeError("ct must be of type: bytes")
+        self._header_ct = header_ct
+        self._ct = ct
+
+    @property
+    def header_ct(self):
+        return self._header_ct
+
+    @property
+    def ct(self):
+        return self._ct
+
+# --- state.py ---
+
+class State(SerializableIface):
+    def __init__(self, keypair, public_key, keystorage, root_chain, symmetric_chain):
+        self._dh_pair = None
+        self._dh_pk_r = None
+
+        self._root = None
+        self._send = None
+        self._receive = None
+        self._prev_send_len = 0
+
+        self._hk_s = None
+        self._hk_r = None
+        self._next_hk_s = None
+        self._next_hk_r = None
+
+        self._delayed_send_ratchet = False
+
+        self._skipped_mks = None
+        self._skipped_count = 0
+
+        self._keypair = keypair
+        self._public_key = public_key
+        self._keystorage = keystorage
+        self._root_chain = root_chain
+        self._symmetric_chain = symmetric_chain
+
+    def init_sender(self, sk, dh_pk_r):
+        self._dh_pair = self._keypair.generate_dh()
+        self._dh_pk_r = dh_pk_r
+
+        self._root = self._root_chain()
+        self._root.ck = sk
+        self._send = self._symmetric_chain()
+        self._receive = self._symmetric_chain()
+        self._prev_send_len = 0
+
+        self._delayed_send_ratchet = True
+
+        self._skipped_mks = self._keystorage()
+        self._skipped_count = 0
+
+    def init_sender_he(self, sk, dh_pk_r, hk_s, next_hk_r):
+        self._dh_pair = self._keypair.generate_dh()
+        self._dh_pk_r = dh_pk_r
+
+        self._root = self._root_chain()
+        self._root.ck = sk
+        self._send = self._symmetric_chain()
+        self._receive = self._symmetric_chain()
+        self._prev_send_len = 0
+
+        self._hk_s = hk_s
+        self._hk_r = None
+        self._next_hk_s = None
+        self._next_hk_r = next_hk_r
+
+        self._delayed_send_ratchet = True
+
+        self._skipped_mks = self._keystorage()
+        self._skipped_count = 0
+
+    def init_receiver(self, sk, dh_pair):
+        self._dh_pair = dh_pair
+        self._dh_pk_r = None
+
+        self._root = self._root_chain()
+        self._root.ck = sk
+        self._send = self._symmetric_chain()
+        self._receive = self._symmetric_chain()
+        self._prev_send_len = 0
+
+        self._delayed_send_ratchet = False
+
+        self._skipped_mks = self._keystorage()
+        self._skipped_count = 0
+
+    def init_receiver_he(self, sk, dh_pair, next_hk_s, next_hk_r):
+        self._dh_pair = dh_pair
+        self._dh_pk_r = None
+
+        self._root = self._root_chain()
+        self._root.ck = sk
+        self._send = self._symmetric_chain()
+        self._receive = self._symmetric_chain()
+        self._prev_send_len = 0
+
+        self._hk_s = None
+        self._hk_r = None
+        self._next_hk_s = next_hk_s
+        self._next_hk_r = next_hk_r
+
+        self._delayed_send_ratchet = False
+
+        self._skipped_mks = self._keystorage()
+        self._skipped_count = 0
+
+    @property
+    def dh_pair(self):
+        return self._dh_pair
+
+    @dh_pair.setter
+    def dh_pair(self, val):
+        self._dh_pair = val
+
+    @property
+    def dh_pk_r(self):
+        return self._dh_pk_r
+
+    @dh_pk_r.setter
+    def dh_pk_r(self, val):
+        self._dh_pk_r = val
+
+    @property
+    def root(self):
+        return self._root
+
+    @property
+    def send(self):
+        return self._send
+
+    @property
+    def receive(self):
+        return self._receive
+
+    @property
+    def prev_send_len(self):
+        return self._prev_send_len
+
+    @prev_send_len.setter
+    def prev_send_len(self, val):
+        self._prev_send_len = val
+
+    @property
+    def hk_s(self):
+        return self._hk_s
+
+    @hk_s.setter
+    def hk_s(self, val):
+        self._hk_s = val
+
+    @property
+    def hk_r(self):
+        return self._hk_r
+
+    @hk_r.setter
+    def hk_r(self, val):
+        self._hk_r = val
+
+    @property
+    def next_hk_s(self):
+        return self._next_hk_s
+
+    @next_hk_s.setter
+    def next_hk_s(self, val):
+        self._next_hk_s = val
+
+    @property
+    def next_hk_r(self):
+        return self._next_hk_r
+
+    @next_hk_r.setter
+    def next_hk_r(self, val):
+        self._next_hk_r = val
+
+    @property
+    def delayed_send_ratchet(self):
+        return self._delayed_send_ratchet
+
+    @delayed_send_ratchet.setter
+    def delayed_send_ratchet(self, val):
+        self._delayed_send_ratchet = val
+
+    @property
+    def skipped_mks(self):
+        return self._skipped_mks
+
+    @property
+    def skipped_count(self):
+        return self._skipped_count
+
+    @skipped_count.setter
+    def skipped_count(self, val):
+        self._skipped_count = val
+
+    def serialize(self):
+        return {
+            "dh_pair" : self._dh_pair.serialize(),
+            "dh_pk_r": self._dh_pk_r.serialize(),
+            "root": self._root.serialize(),
+            "send": self._send.serialize(),
+            "receive": self._receive.serialize(),
+            "prev_send_len": self._prev_send_len,
+            "hk_s": self._hk_s,
+            "hk_r": self._hk_r,
+            "next_hk_s": self._next_hk_s,
+            "next_hk_r": self._next_hk_r,
+            "delayed_send_ratchet": self._delayed_send_ratchet,
+            "skipped_mks": self._skipped_mks.serialize(),
+            "skipped_count": self._skipped_count,
+            "keypair_class": pickle.dumps(self._keypair),
+            "pk_class": pickle.dumps(self._public_key),
+            "keystorage_class": pickle.dumps(self._keystorage),
+            "root_chain_class": pickle.dumps(self._root_chain),
+            "symmetric_chain_class": pickle.dumps(self._symmetric_chain)
+        }
+
+    @classmethod
+    def deserialize(cls, serialized_dict):
+        if not isinstance(serialized_dict, dict):
+            raise TypeError("serialized_dict must be of type: dict")
+
+        keypair_class = pickle.loads(serialized_dict["keypair_class"])
+        pk_class = pickle.loads(serialized_dict["pk_class"])
+        keystorage_class = pickle.loads(serialized_dict["keystorage_class"])
+        root_chain_class = pickle.loads(serialized_dict["root_chain_class"])
+        symmetric_chain_class = pickle.loads(serialized_dict["symmetric_chain_class"])
+
+        state = cls(keypair_class, pk_class, keystorage_class, root_chain_class, symmetric_chain_class)
+
+        state._dh_pair = keypair_class.deserialize(serialized_dict["dh_pair"])
+        state._dh_pk_r = pk_class.deserialize(serialized_dict["dh_pk_r"])
+        state._root = root_chain_class.deserialize(serialized_dict["root"])
+        state._send = symmetric_chain_class.deserialize(serialized_dict["send"])
+        state._receive = symmetric_chain_class.deserialize(serialized_dict["receive"])
+        state._prev_send_len = serialized_dict["prev_send_len"]
+        state._hk_s = serialized_dict["hk_s"]
+        state._hk_r = serialized_dict["hk_r"]
+        state._next_hk_s = serialized_dict["next_hk_s"]
+        state._next_hk_r = serialized_dict["next_hk_r"]
+        state._delayed_send_ratchet = serialized_dict["delayed_send_ratchet"]
+        state._skipped_mks = keystorage_class.deserialize(serialized_dict["skipped_mks"])
+        state._skipped_count = serialized_dict["skipped_count"]
+
+        return state
+
+# --- ratchet.py ---
+
+class MaxSkippedMksExceeded(Exception):
+    pass
+
+class Ratchet(RatchetIface):
     MAX_SKIP = 1000
     MAX_STORE = 2000
 
     @staticmethod
-    def kdf_rk(rk: bytes, dh_out: bytes) -> Tuple[bytes, bytes]:
-        hkdf = HKDF(
-            algorithm=hashes.SHA256(),
-            length=64,
-            salt=None,
-            info=b'DoubleRatchetRK',
-            backend=default_backend()
-        ).derive(ByteUtil.concat(rk, dh_out))
-        return hkdf[:32], hkdf[32:]
+    def encrypt_message(state, pt, associated_data, aead):
+        if not isinstance(state, State):
+            raise TypeError("state must be of type: state")
+        if not isinstance(pt, str):
+            raise TypeError("pt must be of type: string")
+        if not isinstance(associated_data, bytes):
+            raise TypeError("associated_data must be of type: bytes")
+        if not issubclass(aead, AEADIFace):
+            raise TypeError("aead must implement AEADIface")
+
+        if state.delayed_send_ratchet:
+            state.send.ck = state.root.ratchet(state.dh_pair.dh_out(state.dh_pk_r))[0]
+            state.delayed_send_ratchet = False
+
+        mk = state.send.ratchet()
+        header = Header(state.dh_pair.public_key, state.prev_send_len, state.send.msg_no)
+        state.send.msg_no += 1
+
+        ct = aead.encrypt(mk, pt.encode("utf-8"), associated_data + bytes(header))
+        return Message(header, ct)
 
     @staticmethod
-    def kdf_ck(ck: bytes) -> Tuple[bytes, bytes]:
-        hkdf = HKDF(
-            algorithm=hashes.SHA256(),
-            length=64,
-            salt=None,
-            info=b'DoubleRatchetCK',
-            backend=default_backend()
-        ).derive(ck)
-        return hkdf[:32], hkdf[32:64]
+    def decrypt_message(state, msg, associated_data, aead, keypair):
+        if not isinstance(state, State):
+            raise TypeError("state must be of type: state")
+        if not isinstance(msg, Message):
+            raise TypeError("msg must be of type: Message")
+        if not isinstance(associated_data, bytes):
+            raise TypeError("associated_data must be of type: bytes")
+        if not issubclass(aead, AEADIFace):
+            raise TypeError("aead must implement AEADIface")
+        if not issubclass(keypair, DHKeyPairIface):
+            raise TypeError("keypair must implement DHKeyPairIface")
 
-    @staticmethod
-    def encrypt(state: DoubleRatchetStateCombined, plaintext: str, ad: bytes) -> Tuple[bytes, bytes]:
-        if not isinstance(plaintext, str):
-            raise TypeError("plaintext must be of type: string")
-        state.CKs, mk = DoubleRatchetCombined.kdf_ck(state.CKs)
-        nonce = secrets.token_bytes(CHACHA20_NONCE_SIZE)
-        cipher = ChaCha20Poly1305(mk)
-        header = Header(
-            state.DHs.public_key().public_bytes(
-                encoding=serialization.Encoding.Raw,
-                format=serialization.PublicFormat.Raw
-            ),
-            state.PN,
-            state.Ns
-        )
-        ciphertext = cipher.encrypt(nonce, plaintext.encode("utf-8"), ByteUtil.concat(ad, bytes(header)))
-        state.Ns += 1
-        return bytes(header) + nonce, ciphertext
+        pt = try_skipped_mks(state, msg.header, msg.ct, associated_data, aead)
+        if pt is not None:
+            state.skipped_mks.notify_event()
+            return pt
 
-    @staticmethod
-    def decrypt(state: DoubleRatchetStateCombined, header_bytes: bytes, ciphertext: bytes, ad: bytes) -> str:
-        header = Header.from_bytes(header_bytes[:Header.KEY_LEN + 8])
-        nonce = header_bytes[Header.KEY_LEN + 8:Header.KEY_LEN + 8 + CHACHA20_NONCE_SIZE]
-        dh_pub = x25519.X25519PublicKey.from_public_bytes(header.dh_pk)
-        if state.DHr is None or dh_pub.public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw
-        ) != state.DHr.public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw
-        ):
-            DoubleRatchetCombined.skip_message_keys(state, header.msg_no)
-            DoubleRatchetCombined.dh_ratchet(state, dh_pub)
-        DoubleRatchetCombined.skip_message_keys(state, header.msg_no)
-        state.CKr, mk = DoubleRatchetCombined.kdf_ck(state.CKr)
-        state.Nr += 1
-        cipher = ChaCha20Poly1305(mk)
-        pt_bytes = cipher.decrypt(nonce, ciphertext, ByteUtil.concat(ad, header_bytes[:Header.KEY_LEN + 8]))
+        if not state.dh_pk_r:
+            dh_ratchet(state, msg.header.dh_pk, keypair)
+        elif not state.dh_pk_r.is_equal_to(msg.header.dh_pk):
+            skip_over_mks(state, msg.header.prev_chain_len, state.dh_pk_r.pk_bytes())
+            dh_ratchet(state, msg.header.dh_pk, keypair)
+
+        skip_over_mks(state, msg.header.msg_no, state.dh_pk_r.pk_bytes())
+        mk = state.receive.ratchet()
+        state.receive.msg_no += 1
+
+        pt_bytes = aead.decrypt(mk, msg.ct, associated_data + bytes(msg.header))
+        state.skipped_mks.notify_event()
+
         return pt_bytes.decode("utf-8")
 
-    @staticmethod
-    def skip_message_keys(state: DoubleRatchetStateCombined, until: int):
-        if state.Nr + DoubleRatchetCombined.MAX_SKIP < until:
-            raise InvalidMessageException("Too many skipped message keys")
-        if state.CKr:
-            while state.Nr < until:
-                state.CKr, mk = DoubleRatchetCombined.kdf_ck(state.CKr)
-                state.MKSKIPPED.put((state.DHr.public_bytes(
-                    encoding=serialization.Encoding.Raw,
-                    format=serialization.PublicFormat.Raw), state.Nr), mk)
-                state.Nr += 1
+def try_skipped_mks(state, header, ct, associated_data, aead):
+    hdr_pk_bytes = header.dh_pk.pk_bytes()
+    mk = state.skipped_mks.lookup((hdr_pk_bytes, header.msg_no))
+    if mk:
+        state.skipped_mks.delete((hdr_pk_bytes, header.msg_no))
+        pt_bytes = aead.decrypt(mk, ct, associated_data + bytes(header))
+        return pt_bytes.decode("utf-8")
+    return None
 
-    @staticmethod
-    def dh_ratchet(state: DoubleRatchetStateCombined, header_dh: x25519.X25519PublicKey):
-        state.PN = state.Ns
-        state.Ns = 0
-        state.Nr = 0
-        state.DHr = header_dh
-        rk, ckr = DoubleRatchetCombined.kdf_rk(state.RK, state.DHs.exchange(state.DHr))
-        state.RK, state.CKr = rk, ckr
-        state.DHs = KeyHelper.generate_x25519_key_pair()
-        rk, cks = DoubleRatchetCombined.kdf_rk(state.RK, state.DHs.exchange(state.DHr))
-        state.RK, state.CKs = rk, cks
+def skip_over_mks(state, end_msg_no, map_key):
+    new_skip = end_msg_no - state.receive.msg_no
+    if new_skip + state.skipped_count > Ratchet.MAX_SKIP:
+        raise MaxSkippedMksExceeded("Too many messages skipped in current chain")
+    if new_skip + state.skipped_mks.count() > Ratchet.MAX_STORE:
+        raise MaxSkippedMksExceeded("Too many messages stored")
+    elif state.receive.ck is not None:
+        while state.receive.msg_no < end_msg_no:
+            mk = state.receive.ratchet()
+            if state.skipped_mks.count() == Ratchet.MAX_SKIP:
+                state.skipped_mks.delete(state.skipped_mks.front())
+            state.skipped_mks.put((map_key, state.receive.msg_no), mk)
+            state.receive.msg_no += 1
+        state.skipped_count += new_skip
 
-# --- End: Double Ratchet (Extended/Combined) ---
+def dh_ratchet(state, dh_pk_r, keypair):
+    if state.delayed_send_ratchet:
+        state.send.ck = state.root.ratchet(state.dh_pair.dh_out(dh_pk_r))[0]
 
-class AESCipher:
-    @staticmethod
-    def encrypt_gcm(key: bytes, plaintext: bytes, associated_data: bytes = b'') -> Tuple[bytes, bytes, bytes]:
-        nonce = secrets.token_bytes(AESGCM_NONCE_SIZE)
-        cipher = AESGCM(key)
-        ciphertext = cipher.encrypt(nonce, plaintext, associated_data)
-        return nonce, ciphertext, b''
-    @staticmethod
-    def decrypt_gcm(key: bytes, nonce: bytes, ciphertext: bytes, associated_data: bytes = b'') -> bytes:
-        cipher = AESGCM(key)
-        return cipher.decrypt(nonce, ciphertext, associated_data)
-    @staticmethod
-    def encrypt_cbc(key: bytes, plaintext: bytes, iv: bytes) -> bytes:
-        pad_len = 16 - (len(plaintext) % 16)
-        plaintext += bytes([pad_len] * pad_len)
-        cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
-        encryptor = cipher.encryptor()
-        return encryptor.update(plaintext) + encryptor.finalize()
-    @staticmethod
-    def decrypt_cbc(key: bytes, ciphertext: bytes, iv: bytes) -> bytes:
-        cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
-        decryptor = cipher.decryptor()
-        plaintext = decryptor.update(ciphertext) + decryptor.finalize()
-        pad_len = plaintext[-1]
-        return plaintext[:-pad_len]
+    state.dh_pk_r = dh_pk_r
+    state.receive.ck = state.root.ratchet(state.dh_pair.dh_out(state.dh_pk_r))[0]
+    state.dh_pair = keypair.generate_dh()
+    state.delayed_send_ratchet = True
+    state.prev_send_len = state.send.msg_no
+    state.send.msg_no = 0
+    state.receive.msg_no = 0
+    state.skipped_count = 0
+
+# --- session.py ---
+
+class DRSession(SerializableIface):
+    def __init__(
+        self,
+        state: State = None,
+        aead: AEADIFace = AES256GCM,
+        keypair: DHKeyPairIface = DHKeyPair,
+        public_key: DHPublicKeyIface = DHPublicKey,
+        keystorage: MsgKeyStorageIface = MsgKeyStorage,
+        root_chain: RootChainIface = RootChain,
+        symmetric_chain: SymmetricChainIface = SymmetricChain,
+        ratchet: RatchetIface = Ratchet) -> None:
+
+        if state and not isinstance(state, State):
+            raise TypeError("state must be of type: State")
+        if not issubclass(aead, AEADIFace):
+            raise TypeError("aead must implement AEADIFace")
+        if not issubclass(keypair, DHKeyPairIface):
+            raise TypeError("keypair must implement DHKeyPairIface")
+        if not issubclass(public_key, DHPublicKeyIface):
+            raise TypeError("public_key must implement DHPublicKeyIface")
+        if not issubclass(keystorage, MsgKeyStorageIface):
+            raise TypeError("keystorage must implement MsgKeyStorageIface")
+        if not issubclass(root_chain, RootChainIface):
+            raise TypeError("root_chain must implement KDFChainIface")
+        if not issubclass(symmetric_chain, SymmetricChainIface):
+            raise TypeError("symmetric_chain must implement SymmetricChainIface")
+        if not issubclass(ratchet, RatchetIface):
+            raise TypeError("ratchet must be of type: RatchetIface")
+
+        self._aead = aead
+        self._keypair = keypair
+        self._ratchet = ratchet
+
+        if state:
+            self._state = state
+        else:
+            self._state = State(keypair, public_key, keystorage, root_chain, symmetric_chain)
+
+    def setup_sender(self, sk: bytes, dh_pk_r: DHPublicKey) -> None:
+        if not isinstance(sk, bytes):
+            raise TypeError("sk must be of type: bytes")
+        if not isinstance(dh_pk_r, DHPublicKey):
+            raise TypeError("dh_pk_r must be of type: DHPublicKey")
+        self._state.init_sender(sk, dh_pk_r)
+
+    def setup_receiver(self, sk: bytes, dh_pair: DHKeyPair) -> None:
+        if not isinstance(sk, bytes):
+            raise TypeError("sk must be of type: bytes")
+        if not isinstance(dh_pair, DHKeyPair):
+            raise TypeError("dh_pair must be of type: DHKeyPair")
+        self._state.init_receiver(sk, dh_pair)
+
+    def encrypt_message(self, pt: str, associated_data: bytes) -> Message:
+        if not isinstance(pt, str):
+            raise TypeError("pt must be of type: string")
+        if not isinstance(associated_data, bytes):
+            raise TypeError("associated_data must be of type: bytes")
+
+        msg = self._ratchet.encrypt_message(
+            self._state, pt, associated_data, self._aead)
+        return msg
+
+    def decrypt_message(self, msg: Message, associated_data: bytes) -> str:
+        if not isinstance(msg, Message):
+            raise TypeError("msg must be of type: Message")
+        if not isinstance(associated_data, bytes):
+            raise TypeError("associated_data must be of type: bytes")
+
+        pt = self._ratchet.decrypt_message(
+            self._state, msg, associated_data, self._aead, self._keypair)
+        return pt
+
+    def generate_dh_keys(self) -> DHKeyPair:
+        return self._keypair.generate_dh()
+
+    def serialize(self) -> dict:
+        return {
+            "state" : self._state.serialize(),
+            "aead": pickle.dumps(self._aead),
+            "keypair": pickle.dumps(self._keypair),
+            "ratchet": pickle.dumps(self._ratchet)
+        }
+
+    @classmethod
+    def deserialize(cls, serialized_dict: dict):
+        if not isinstance(serialized_dict, dict):
+            raise TypeError("serialized_dict must be of type: dict")
+
+        return cls(
+            state=State.deserialize(serialized_dict["state"]),
+            aead=pickle.loads(serialized_dict["aead"]),
+            keypair=pickle.loads(serialized_dict["keypair"]),
+            ratchet=pickle.loads(serialized_dict["ratchet"])
+        )
