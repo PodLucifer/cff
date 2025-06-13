@@ -1,17 +1,3 @@
-"""
-Highly custom, production-grade Double Ratchet Algorithm library for Python.
-Implements the Double Ratchet per the "Double Ratchet Algorithm" specification (Revision 1, 2016-11-20).
-- Uses X25519 (pynacl) for DH ratchet.
-- Uses HKDF-SHA256 (cryptography) for KDF chains.
-- Uses HMAC-SHA256 (cryptography) for message KDFs.
-- Uses AES-256-CBC+HMAC-SHA256 (cryptography) for AEAD (see spec).
-- Serialization via pickle.
-- No Alice/Bob logic; exposes a DoubleRatchet class for integration.
-- Supports header encryption variant.
-- Designed for production use, not simulation or placeholder/prototype.
-- Refer to the official spec and image1 for ratchet key/chain transitions.
-"""
-
 import os
 import abc
 import pickle
