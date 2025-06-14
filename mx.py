@@ -27,7 +27,7 @@ from pathlib import Path
 
 # HTML Parsing & UserAgent
 from bs4 import BeautifulSoup
-from fake_useragent import UserAgent
+
 
 # Protocol-specific
 import paramiko        # SSH
@@ -81,9 +81,9 @@ def human_delay(jitter=0.45, base=0.7):
     time.sleep(delay)
 
 def random_headers():
-    ua = UserAgent()
+    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:115.0) Gecko/20100101 Firefox/115.0"
     headers = {
-        "User-Agent": ua.random,
+        "User-Agent": ua,
         "Referer": random.choice(REFERERS),
         "X-Forwarded-For": random_ip(),
         "X-Real-IP": random_ip(),
@@ -93,7 +93,7 @@ def random_headers():
         "Pragma": "no-cache",
     }
     return headers
-
+    
 def load_list(filename):
     with open(filename, "r", encoding="utf-8") as f:
         return [line.strip() for line in f if line.strip()]
