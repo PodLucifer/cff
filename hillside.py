@@ -3,12 +3,12 @@ import random
 from mathutils import Vector
 
 # --------------- PARAMETERS ---------------
-NUM_ROCKS = 15
+NUM_ROCKS = 25
 NUM_STONES = 20
-ROCK_SIZE = 0.4  # meters (40 cm)
+ROCK_SIZE = 0.2  # meters (40 cm)
 STONE_SIZE = 0.03  # meters (3 cm)
 HILL_TILT_DEG = 35
-HILL_LENGTH = 15
+HILL_LENGTH = 33  # <<-- Made hillside much longer (was 15)
 HILL_WIDTH = 8
 POWDER_PARTICLES = 15000
 DUST_VOLUME_SIZE = (8, 3, 2)
@@ -25,12 +25,54 @@ hillside.scale = (HILL_LENGTH, HILL_WIDTH, 1)
 hillside.rotation_euler[0] = HILL_TILT_DEG * 3.1416 / 180
 bpy.ops.object.transform_apply(location=False, rotation=True, scale=True)
 
-# Add some displace for rocky look
-mod = hillside.modifiers.new('Displace', 'DISPLACE')
-tex = bpy.data.textures.new('HillsideTex', 'CLOUDS')
-mod.texture = tex
-mod.strength = 2.2
+# --- Much More Sophisticated Hillside Geometry/Displacement ---
+# Add multiple displacement layers, large-scale and fine detail
+# 1. Base displacement for big undulations
+mod1 = hillside.modifiers.new('DisplaceBig', 'DISPLACE')
+tex1 = bpy.data.textures.new('HillBigTex', 'CLOUDS')
+tex1.noise_scale = 7.0
+tex1.nabla = 0.07
+mod1.texture = tex1
+mod1.strength = 2.5
+mod1.mid_level = 0.45
+
+# 2. Medium-scale erosion and flow effects
+mod2 = hillside.modifiers.new('DisplaceMed', 'DISPLACE')
+tex2 = bpy.data.textures.new('HillMedTex', 'VORONOI')
+tex2.noise_scale = 2.2
+mod2.texture = tex2
+mod2.strength = 0.8
+mod2.mid_level = 0.65
+
+# 3. Fine rock/grit displacement (adds realism)
+mod3 = hillside.modifiers.new('DisplaceFine', 'DISPLACE')
+tex3 = bpy.data.textures.new('HillFineTex', 'MUSGRAVE')
+tex3.noise_scale = 0.34
+mod3.texture = tex3
+mod3.strength = 0.27
+mod3.mid_level = 0.48
+
+# 4. Subdivide for higher mesh detail (needed for realistic displacement)
+bpy.context.view_layer.objects.active = hillside
+subdiv = hillside.modifiers.new('Subdivision', 'SUBSURF')
+subdiv.levels = 4
+subdiv.render_levels = 5
+
+bpy.ops.object.modifier_move_to_index(modifier="Subdivision", index=0)  # Subdivide first
 bpy.ops.object.shade_smooth()
+
+# --- Add subtle color variation to the hillside (vertex colors) for realism ---
+if not hillside.data.vertex_colors:
+    hillside.data.vertex_colors.new(name="HillVColor")
+vcol = hillside.data.vertex_colors["HillVColor"]
+for poly in hillside.data.polygons:
+    for loop_index in poly.loop_indices:
+        vcol.data[loop_index].color = (
+            0.93 + random.uniform(-0.03, 0.03),
+            0.88 + random.uniform(-0.02, 0.02),
+            0.74 + random.uniform(-0.04, 0.04),
+            1.0
+        )
 
 # --------------- ROCK SHAPE FROM IMAGE (image3) ---------------
 def create_rock(location, size):
